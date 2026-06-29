@@ -10,6 +10,8 @@ from auth import CookieManager
 from cli.progress_display import ProgressDisplay
 from config import ConfigLoader
 from control import QueueManager, RateLimiter, RetryHandler
+from control.sync_manager import SyncManager
+from control.sync_scheduler import SyncScheduler
 from core import DouyinAPIClient, DownloaderFactory, URLParser
 from core import LoginRequiredError
 from cli.login_flow import can_interactive_login, interactive_relogin
@@ -179,7 +181,7 @@ async def download_url(
 
 
 async def main_async(args):
-    if not args.serve:
+    if not args.serve and not args.sync:
         display.show_banner()
 
     if args.config:
@@ -208,7 +210,7 @@ async def main_async(args):
     if args.path:
         config.update(path=args.path)
 
-    # 独立子命令：热榜 / 搜索 / 服务
+    # 独立子命令：热榜 / 搜索 / 服务 / 同步
     if args.hot_board is not None or args.search:
         discovery_cm = CookieManager()
         discovery_cm.set_cookies(config.get_cookies())
@@ -220,6 +222,9 @@ async def main_async(args):
         return
     if args.serve:
         await _run_serve_subcommand(args, config)
+        return
+    if args.sync or args.sync_once:
+        await _run_sync_command(args, config)
         return
 
     if args.url:
@@ -347,6 +352,103 @@ async def _run_serve_subcommand(args, config: ConfigLoader) -> None:
     await run_server(config, host=args.serve_host, port=args.serve_port)
 
 
+async def _run_sync_command(args, config: ConfigLoader) -> None:
+    """执行同步命令"""
+    if not config.validate():
+        display.print_error("Invalid configuration: missing required fields")
+        return
+
+    cookies = config.get_cookies()
+    cookie_manager = CookieManager()
+    cookie_manager.set_cookies(cookies)
+
+    if not cookie_manager.validate_cookies():
+        display.print_warning("Cookies may be invalid or incomplete")
+
+    database = None
+    if config.get("database"):
+        db_path = config.get("database_path", "dy_downloader.db") or "dy_downloader.db"
+        database = Database(db_path=str(db_path))
+        await database.initialize()
+        display.print_success("Database initialized")
+
+    # 创建API客户端
+    async with DouyinAPIClient(
+        cookie_manager.get_cookies(),
+        proxy=config.get("proxy"),
+    ) as api_client:
+        # 创建同步管理器
+        sync_manager = SyncManager(api_client, database, config.config)
+
+        if args.sync_once:
+            # 执行一次同步
+            display.print_info("Executing one-time sync...")
+            result = await sync_manager.sync_collects()
+
+            if result.get("status") == "completed":
+                display.print_success("Sync completed successfully")
+                display.print_info(f"Sync ID: {result.get('sync_id')}")
+                display.print_info(f"Total videos: {result.get('total_videos')}")
+                display.print_info(f"Processed videos: {result.get('processed_videos')}")
+                display.print_info(f"Duration: {result.get('duration_seconds')} seconds")
+            else:
+                display.print_error(f"Sync failed: {result.get('error')}")
+
+            if database:
+                await database.close()
+            return
+
+        # 启动定时同步
+        if not config.get("sync", {}).get("enabled", False):
+            display.print_warning("Sync is disabled in config. Enable it first.")
+            if database:
+                await database.close()
+            return
+
+        # 更新cron表达式（如果通过参数指定）
+        sync_config = config.get("sync", {}).copy()
+        if args.sync_cron:
+            sync_config["cron_expression"] = args.sync_cron
+            config.update(sync=sync_config)
+            config.save()  # 保存到配置文件
+
+        display.print_info(f"Starting sync scheduler with cron: {sync_config.get('cron_expression')}")
+
+        # 创建调度器
+        scheduler = SyncScheduler(sync_manager, config.config)
+
+        # 启动调度器
+        scheduler.start()
+
+        try:
+            # 显示状态
+            status = await scheduler.get_status()
+            display.print_info(f"Scheduler started: {status}")
+
+            # 显示同步历史
+            history = await scheduler.get_sync_history(limit=5)
+            if history:
+                display.print_info("\nRecent sync history:")
+                for sync in history:
+                    display.print_info(f"  - {sync['sync_id']}: {sync['status']} at {sync['created_at']}")
+
+            # 保持运行（按Ctrl+C停止）
+            if args.sync_cron:
+                display.print_info("Press Ctrl+C to stop the scheduler")
+                while True:
+                    await asyncio.sleep(1)
+            else:
+                # 如果没有指定cron，只运行一次
+                await asyncio.sleep(1)
+
+        except KeyboardInterrupt:
+            display.print_warning("\nSync scheduler interrupted by user")
+        finally:
+            await scheduler.stop()
+            if database:
+                await database.close()
+
+
 async def _dispatch_notifications(config: ConfigLoader, total_result: Any, url_count: int) -> None:
     notifier = build_notifier(config)
     if not notifier.enabled:
@@ -416,6 +518,9 @@ def main():
     )
     parser.add_argument("--serve-host", type=str, default="127.0.0.1", help="REST 服务监听地址")
     parser.add_argument("--serve-port", type=int, default=8000, help="REST 服务监听端口")
+    parser.add_argument("--sync", action="store_true", help="执行收藏夹同步")
+    parser.add_argument("--sync-once", action="store_true", help="执行一次同步后退出")
+    parser.add_argument("--sync-cron", type=str, help="设置同步的cron表达式")
     try:
         from __init__ import __version__
     except ImportError:

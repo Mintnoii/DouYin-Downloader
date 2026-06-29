@@ -120,6 +120,47 @@ class Database:
         await db.execute("CREATE INDEX IF NOT EXISTS idx_job_created_at ON job(created_at)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_job_status ON job(status)")
 
+        # 同步历史表
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS sync_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sync_id TEXT NOT NULL UNIQUE,
+                started_at TIMESTAMP NOT NULL,
+                completed_at TIMESTAMP,
+                status TEXT NOT NULL CHECK(status IN ('pending', 'running', 'completed', 'failed')),
+                total_videos INTEGER DEFAULT 0,
+                new_videos INTEGER DEFAULT 0,
+                processed_videos INTEGER DEFAULT 0,
+                failed_videos INTEGER DEFAULT 0,
+                error_message TEXT,
+                config TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # 视频处理状态表
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS video_processing_status (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sync_id TEXT NOT NULL,
+                aweme_id TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(status IN ('pending', 'processing', 'completed', 'failed')),
+                file_path TEXT,
+                transcript_path TEXT,
+                error_message TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (sync_id) REFERENCES sync_history(sync_id)
+            )
+        """)
+
+        # 为同步表创建索引
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_sync_history_status ON sync_history(status)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_sync_history_started_at ON sync_history(started_at)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_video_processing_status_sync_id ON video_processing_status(sync_id)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_video_processing_status_aweme_id ON video_processing_status(aweme_id)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_video_processing_status_status ON video_processing_status(status)")
+
         # Incremental migration: add author_sec_uid column to legacy aweme tables.
         # Running initialize() twice must be a no-op.
         cursor = await db.execute("PRAGMA table_info(aweme)")
@@ -468,6 +509,188 @@ class Database:
                     deleted += cursor.rowcount
             await db.commit()
         return deleted
+
+    # ------------------------------------------------------------------
+    # 同步功能数据库操作
+    # ------------------------------------------------------------------
+
+    async def create_sync_history(self, sync_data: Dict[str, Any]) -> str:
+        """创建同步历史记录，返回sync_id"""
+        sync_id = f"sync_{int(datetime.now().timestamp())}"
+        db = await self._get_conn()
+        await db.execute(
+            """
+            INSERT INTO sync_history
+            (sync_id, started_at, status, config)
+            VALUES (?, ?, ?, ?)
+        """,
+            (
+                sync_id,
+                datetime.now().isoformat(),
+                sync_data.get("status", "pending"),
+                json.dumps(sync_data.get("config", {})),
+            ),
+        )
+        await db.commit()
+        return sync_id
+
+    async def update_sync_history(self, sync_id: str, updates: Dict[str, Any]) -> None:
+        """更新同步历史记录"""
+        db = await self._get_conn()
+        update_fields = []
+        params = []
+
+        for key, value in updates.items():
+            if key in ["status", "total_videos", "new_videos", "processed_videos", "failed_videos", "error_message", "completed_at"]:
+                update_fields.append(f"{key} = ?")
+                params.append(value)
+
+        if update_fields:
+            if "completed_at" in updates:
+                params.append(datetime.now().isoformat())
+            params.append(sync_id)
+
+            sql = f"""
+                UPDATE sync_history
+                SET {', '.join(update_fields)}
+                WHERE sync_id = ?
+            """
+            await db.execute(sql, params)
+            await db.commit()
+
+    async def get_sync_history(self, limit: int = 50) -> List[Dict[str, Any]]:
+        """获取同步历史记录"""
+        db = await self._get_conn()
+        cursor = await db.execute(
+            """
+            SELECT sync_id, started_at, completed_at, status, total_videos,
+                   new_videos, processed_videos, failed_videos, error_message,
+                   config, created_at
+            FROM sync_history
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+        rows = await cursor.fetchall()
+
+        return [
+            {
+                "sync_id": row[0],
+                "started_at": row[1],
+                "completed_at": row[2],
+                "status": row[3],
+                "total_videos": row[4] or 0,
+                "new_videos": row[5] or 0,
+                "processed_videos": row[6] or 0,
+                "failed_videos": row[7] or 0,
+                "error_message": row[8],
+                "config": json.loads(row[9]) if row[9] else {},
+                "created_at": row[10],
+            }
+            for row in rows
+        ]
+
+    async def create_video_processing_status(self, sync_id: str, aweme_data: Dict[str, Any]) -> int:
+        """创建视频处理状态记录，返回记录ID"""
+        db = await self._get_conn()
+        cursor = await db.execute(
+            """
+            INSERT INTO video_processing_status
+            (sync_id, aweme_id, status, file_path)
+            VALUES (?, ?, ?, ?)
+        """,
+            (
+                sync_id,
+                aweme_data.get("aweme_id"),
+                "pending",
+                aweme_data.get("file_path"),
+            ),
+        )
+        await db.commit()
+        return cursor.lastrowid
+
+    async def update_video_processing_status(self, sync_id: str, aweme_id: str, updates: Dict[str, Any]) -> None:
+        """更新视频处理状态"""
+        db = await self._get_conn()
+        update_fields = []
+        params = []
+
+        for key, value in updates.items():
+            if key in ["status", "file_path", "transcript_path", "error_message"]:
+                update_fields.append(f"{key} = ?")
+                params.append(value)
+
+        if update_fields:
+            update_fields.append("updated_at = ?")
+            params.append(datetime.now().isoformat())
+            params.append(sync_id)
+            params.append(aweme_id)
+
+            sql = f"""
+                UPDATE video_processing_status
+                SET {', '.join(update_fields)}
+                WHERE sync_id = ? AND aweme_id = ?
+            """
+            await db.execute(sql, params)
+            await db.commit()
+
+    async def get_video_processing_status(self, sync_id: str, status: Optional[str] = None) -> List[Dict[str, Any]]:
+        """获取视频处理状态列表"""
+        db = await self._get_conn()
+        where_sql = "WHERE sync_id = ?"
+        params = [sync_id]
+
+        if status:
+            where_sql += " AND status = ?"
+            params.append(status)
+
+        cursor = await db.execute(
+            f"""
+            SELECT id, sync_id, aweme_id, status, file_path,
+                   transcript_path, error_message, created_at, updated_at
+            FROM video_processing_status
+            {where_sql}
+            ORDER BY created_at ASC
+            """,
+            params,
+        )
+        rows = await cursor.fetchall()
+
+        return [
+            {
+                "id": row[0],
+                "sync_id": row[1],
+                "aweme_id": row[2],
+                "status": row[3],
+                "file_path": row[4],
+                "transcript_path": row[5],
+                "error_message": row[6],
+                "created_at": row[7],
+                "updated_at": row[8],
+            }
+            for row in rows
+        ]
+
+    async def get_sync_statistics(self, sync_id: str) -> Dict[str, int]:
+        """获取同步统计信息"""
+        db = await self._get_conn()
+        cursor = await db.execute(
+            """
+            SELECT status, COUNT(*) as count
+            FROM video_processing_status
+            WHERE sync_id = ?
+            GROUP BY status
+            """,
+            (sync_id,),
+        )
+        rows = await cursor.fetchall()
+
+        stats = {"pending": 0, "processing": 0, "completed": 0, "failed": 0}
+        for row in rows:
+            stats[row[0]] = row[1]
+
+        return stats
 
     async def truncate_history(self) -> None:
         """Delete every row from `aweme` and `download_history`.

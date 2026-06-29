@@ -100,4 +100,28 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "max_jobs": 500,  # 内存中保留的 job 条数上限（不含 in-flight）
         "job_ttl_seconds": 86400,  # 完成态 job 保留时间（秒）
     },
+    # 收藏夹定时同步配置
+    "sync": {
+        # 是否启用定时同步
+        "enabled": False,
+        # cron表达式（默认每6小时同步一次）
+        "cron_expression": "0 0 */6 * *",
+        # 启动时是否执行同步
+        "sync_on_startup": False,
+        # 同步模式：incremental（增量）| full（全量）
+        "sync_mode": "incremental",
+        # 指定收藏夹ID，None表示同步所有收藏夹
+        "collects_id": None,
+        # 单次同步最大视频数
+        "max_sync_videos": 100,
+        # 是否转录视频
+        "transcribe_videos": True,
+        # 处理完成后是否清理视频文件
+        "cleanup_videos": True,
+        # 保留视频文件的天数
+        "keep_days": 7,
+        # 重试配置
+        "max_retries": 3,
+        "retry_delay": 60,  # 重试延迟（秒）
+    },
 }

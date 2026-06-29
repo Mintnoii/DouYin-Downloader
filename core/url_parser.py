@@ -31,9 +31,10 @@ class URLParser:
                 result["sec_uid"] = sec_uid
 
         elif url_type == "collection":
-            mix_id = URLParser._extract_mix_id(url)
-            if mix_id:
-                result["mix_id"] = mix_id
+            # 收藏夹需要 collects_id
+            collects_id = URLParser._extract_collects_id(url)
+            if collects_id:
+                result["collects_id"] = collects_id
 
         elif url_type == "gallery":
             note_id = URLParser._extract_note_id(url)
@@ -91,6 +92,13 @@ class URLParser:
     @staticmethod
     def _extract_music_id(url: str) -> Optional[str]:
         match = re.search(r"/music/(\d+)", url)
+        if match:
+            return match.group(1)
+        return None
+
+    @staticmethod
+    def _extract_collects_id(url: str) -> Optional[str]:
+        match = re.search(r"/collection/(\d+)", url)
         if match:
             return match.group(1)
         return None

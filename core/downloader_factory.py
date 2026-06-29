@@ -4,6 +4,7 @@ from auth import CookieManager
 from config import ConfigLoader
 from control import QueueManager, RateLimiter, RetryHandler
 from core.api_client import DouyinAPIClient
+from core.collect_downloader import CollectDownloader
 from core.downloader_base import BaseDownloader
 from core.live_downloader import LiveDownloader
 from core.mix_downloader import MixDownloader
@@ -50,7 +51,7 @@ class DownloaderFactory:
         elif url_type == "gallery":
             return VideoDownloader(**common_args)
         elif url_type == "collection":
-            return MixDownloader(**common_args)
+            return CollectDownloader(**common_args)
         elif url_type == "music":
             return MusicDownloader(**common_args)
         elif url_type == "live":

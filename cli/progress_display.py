@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 from typing import Optional
 
 from rich.console import Console
@@ -13,7 +14,11 @@ from rich.progress import (
 )
 from rich.table import Table
 
-console = Console()
+# Windows 下使用 UTF-8 编码，避免 Unicode 编码错误
+if sys.platform == "win32":
+    console = Console(force_terminal=True, legacy_windows=False)
+else:
+    console = Console()
 
 
 class ProgressDisplay:
@@ -238,16 +243,16 @@ class ProgressDisplay:
         self._active_console().print(table)
 
     def print_info(self, message: str):
-        self._active_console().print(f"[blue]ℹ[/blue] {message}")
+        self._active_console().print(f"[blue][INFO][/blue] {message}")
 
     def print_success(self, message: str):
-        self._active_console().print(f"[green]✓[/green] {message}")
+        self._active_console().print(f"[green][OK][/green] {message}")
 
     def print_warning(self, message: str):
-        self._active_console().print(f"[yellow]⚠[/yellow] {message}")
+        self._active_console().print(f"[yellow][WARN][/yellow] {message}")
 
     def print_error(self, message: str):
-        self._active_console().print(f"[red]✗[/red] {message}")
+        self._active_console().print(f"[red][ERROR][/red] {message}")
 
     def _cleanup_url_tasks(self):
         if not self._progress:

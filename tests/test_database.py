@@ -253,3 +253,184 @@ async def test_database_get_conn_reuses_single_connection_under_concurrency(tmp_
     assert connect_calls == [str(tmp_path / "test.db")]
 
     await database.close()
+
+
+@pytest.mark.asyncio
+async def test_sync_history_table_creation(tmp_path):
+    """测试 sync_history 表的创建和基本操作"""
+    db_path = tmp_path / "test.db"
+    database = Database(str(db_path))
+
+    await database.initialize()
+
+    # 插入同步记录
+    sync_data = {
+        "sync_id": "sync_001",
+        "url": "https://www.douyin.com/user/123",
+        "url_type": "user",
+        "sync_mode": "full",
+        "start_time": 1700000000,
+        "end_time": 1700000001,
+        "total_videos": 10,
+        "new_videos": 8,
+        "existing_videos": 2,
+        "failed_videos": 0,
+        "error_message": None,
+        "config": json.dumps({"path": "./Downloaded/"}, ensure_ascii=False),
+    }
+
+    await database.add_sync_history(sync_data)
+
+    # 验证记录存在
+    record = await database.get_sync_history("sync_001")
+    assert record is not None
+    assert record["sync_id"] == "sync_001"
+    assert record["sync_mode"] == "full"
+    assert record["new_videos"] == 8
+    assert record["end_time"] == 1700000001
+
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_video_processing_status_table_creation(tmp_path):
+    """测试 video_processing_status 表的创建和基本操作"""
+    db_path = tmp_path / "test.db"
+    database = Database(str(db_path))
+
+    await database.initialize()
+
+    # 插入视频处理状态记录
+    processing_data = {
+        "aweme_id": "video_001",
+        "aweme_title": "测试视频",
+        "author_id": "author_123",
+        "author_name": "测试作者",
+        "file_path": "/tmp/video_001.mp4",
+        "file_size": 1024000,
+        "duration": 30,
+        "format": "mp4",
+        "quality": "720p",
+        "processing_status": "pending",
+        "processing_started_at": None,
+        "processing_completed_at": None,
+        "processing_duration": None,
+        "error_message": None,
+        "retry_count": 0,
+        "metadata": json.dumps({"resolution": "1280x720"}, ensure_ascii=False),
+    }
+
+    await database.add_video_processing_status(processing_data)
+
+    # 验证记录存在
+    record = await database.get_video_processing_status("video_001")
+    assert record is not None
+    assert record["aweme_id"] == "video_001"
+    assert record["processing_status"] == "pending"
+    assert record["author_name"] == "测试作者"
+
+    # 更新处理状态
+    updated_data = processing_data.copy()
+    updated_data["processing_status"] = "completed"
+    updated_data["processing_started_at"] = 1700000002
+    updated_data["processing_completed_at"] = 1700000005
+    updated_data["processing_duration"] = 3
+
+    await database.update_video_processing_status(updated_data)
+
+    # 验证更新
+    updated_record = await database.get_video_processing_status("video_001")
+    assert updated_record["processing_status"] == "completed"
+    assert updated_record["processing_duration"] == 3
+
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_sync_history_pagination(tmp_path):
+    """测试 sync_history 表的分页功能"""
+    db_path = tmp_path / "test.db"
+    database = Database(str(db_path))
+
+    await database.initialize()
+
+    # 插入多条同步记录
+    for i in range(5):
+        sync_data = {
+            "sync_id": f"sync_{i:03d}",
+            "url": "https://www.douyin.com/user/123",
+            "url_type": "user",
+            "sync_mode": "full",
+            "start_time": 1700000000 + i,
+            "end_time": 1700000001 + i,
+            "total_videos": 10 + i,
+            "new_videos": 8 + i,
+            "existing_videos": 2,
+            "failed_videos": 0,
+            "error_message": None,
+            "config": json.dumps({"path": "./Downloaded/"}, ensure_ascii=False),
+        }
+        await database.add_sync_history(sync_data)
+
+    # 测试分页查询
+    page1 = await database.get_sync_history_list(page=1, size=2)
+    assert page1["total"] == 5
+    assert len(page1["items"]) == 2
+    assert page1["items"][0]["sync_id"] == "sync_004"  # 按时间倒序
+
+    page2 = await database.get_sync_history_list(page=2, size=2)
+    assert len(page2["items"]) == 2
+    assert page2["items"][0]["sync_id"] == "sync_002"
+
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_video_processing_status_by_author(tmp_path):
+    """测试按作者查询视频处理状态"""
+    db_path = tmp_path / "test.db"
+    database = Database(str(db_path))
+
+    await database.initialize()
+
+    # 插入不同作者的视频处理记录
+    for i in range(3):
+        processing_data = {
+            "aweme_id": f"video_{i:03d}",
+            "aweme_title": f"视频{i}",
+            "author_id": f"author_{i%2}",  # 两个作者
+            "author_name": f"作者{i%2}",
+            "file_path": f"/tmp/video_{i:03d}.mp4",
+            "file_size": 1024000 + i * 1000,
+            "duration": 30 + i,
+            "format": "mp4",
+            "quality": "720p",
+            "processing_status": "completed" if i % 2 == 0 else "pending",
+            "processing_started_at": 1700000002 + i,
+            "processing_completed_at": 1700000005 + i if i % 2 == 0 else None,
+            "processing_duration": 3 + i if i % 2 == 0 else None,
+            "error_message": None,
+            "retry_count": 0,
+            "metadata": json.dumps({"resolution": "1280x720"}, ensure_ascii=False),
+        }
+        await database.add_video_processing_status(processing_data)
+
+    # 按作者查询
+    author0_videos = await database.get_video_processing_status_by_author("author_0")
+    assert len(author0_videos) == 2  # author_0 有 2 个视频
+    assert all(r["author_id"] == "author_0" for r in author0_videos)
+
+    author1_videos = await database.get_video_processing_status_by_author("author_1")
+    assert len(author1_videos) == 1  # author_1 有 1 个视频
+    assert all(r["author_id"] == "author_1" for r in author1_videos)
+
+    # 按状态查询
+    completed_videos = await database.get_video_processing_status_by_status("completed")
+    assert len(completed_videos) == 2
+    assert all(r["processing_status"] == "completed" for r in completed_videos)
+
+    pending_videos = await database.get_video_processing_status_by_status("pending")
+    assert len(pending_videos) == 1
+    assert all(r["processing_status"] == "pending" for r in pending_videos)
+
+    await database.close()
