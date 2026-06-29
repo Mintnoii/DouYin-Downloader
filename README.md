@@ -166,6 +166,12 @@ transcript:
 python run.py -c config.yml
 ```
 
+> **Windows 用户注意：** 若遇到 `UnicodeEncodeError: 'gbk' codec can't encode character` 错误，请在命令前追加 `PYTHONIOENCODING=utf-8`：
+> ```bash
+> PYTHONIOENCODING=utf-8 python run.py -c config.yml
+> ```
+> 建议将 `PYTHONIOENCODING=utf-8` 添加到系统环境变量中一劳永逸。
+
 ### 命令行追加参数
 
 ```bash
@@ -572,6 +578,66 @@ python -m tools.cookie_fetcher --config config.yml
 
 ```bash
 sqlite3 dy_downloader.db "SELECT aweme_id, title, author_name, datetime(download_time, 'unixepoch', 'localtime') FROM aweme ORDER BY download_time DESC LIMIT 20;"
+```
+
+### 6) Windows 下出现 GBK 编码错误？
+
+```
+UnicodeEncodeError: 'gbk' codec can't encode character '⠋'
+```
+
+Rich 进度条库使用了 GBK 不支持的 Unicode 字符。解决方法：
+
+```bash
+# 临时解决：命令前加环境变量
+PYTHONIOENCODING=utf-8 python run.py -c config.yml
+
+# 永久解决：在系统环境变量中添加
+# 变量名: PYTHONIOENCODING  值: utf-8
+```
+
+### 7) 缺少 `croniter` 模块？
+
+```bash
+pip install croniter
+```
+
+该依赖已在 `requirements.txt` 中声明，正常情况下 `pip install -r requirements.txt` 会自动安装。
+
+## 调试工具
+
+### 收藏夹 API 验证工具 (`test_collect_api.py`)
+
+在正式下载前，可以用此脚本验证 Cookie 和收藏夹接口是否正常：
+
+```bash
+python test_collect_api.py
+```
+
+脚本会：
+1. 从 `config.yml` 加载 Cookie
+2. 使用预设的 `collects_id` 调用收藏夹分页接口
+3. 打印返回的视频数量、分页状态和前几条视频预览
+
+**获取 `collects_id` 的方法：**
+
+由于抖音网页版不直接暴露 `/collection/{collects_id}` 格式的 URL，可以通过以下方式获取：
+
+- **浏览器 DevTools**：打开收藏夹页面 → Network 标签 → 搜索 `collect` → 在请求参数中找到 `collects_id`
+- **从已知 URL 参数提取**：`test_collect_api.py` 中的示例值可直接修改使用
+
+拿到 `collects_id` 后，构造 URL `https://www.douyin.com/collection/{collects_id}` 填入 `config.yml` 即可下载。URL 解析器只从中提取数字 ID，不依赖真实 URL 可访问性。
+
+### 已验证通过的测试流程
+
+以下流程在 2026-06-29 于 Windows 11 + Python 3.13 环境完整跑通：
+
+```
+1. pip install -r requirements.txt       # 安装依赖
+2. cp config.example.yml config.yml      # 创建配置文件
+3. python -m tools.cookie_fetcher --config config.yml  # 浏览器登录获取 Cookie
+4. python test_collect_api.py            # 验证 API 连通性
+5. PYTHONIOENCODING=utf-8 python run.py -c config.yml  # 正式下载
 ```
 
 ## 沟通群

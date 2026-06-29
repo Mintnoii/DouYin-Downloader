@@ -8,3 +8,4 @@ gmssl>=3.2.2
 # Bundled ffmpeg static binary for audio extraction before
 # transcription upload. Pinned exact for reproducible sidecar builds.
 imageio-ffmpeg==0.6.0
+croniter>=6.0.0
