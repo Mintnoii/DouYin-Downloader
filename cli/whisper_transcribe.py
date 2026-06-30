@@ -3,7 +3,7 @@
 whisper_transcribe.py — 对 douyin-downloader 下载的视频进行 Whisper 语音识别
 
 安装:
-  pip install openai-whisper rich
+  pip install faster-whisper rich
   # ffmpeg: conda install -c conda-forge ffmpeg  或放 ffmpeg.exe 到同目录
 
 用法:
@@ -13,6 +13,7 @@ whisper_transcribe.py — 对 douyin-downloader 下载的视频进行 Whisper �
   python whisper_transcribe.py -d ./Downloaded/ -m medium # 用medium模型
   python whisper_transcribe.py -d ./Downloaded/ --srt     # 同时输出SRT
   python whisper_transcribe.py --skip-existing --sc       # 跳过已有 + 繁转简
+  python whisper_transcribe.py -f video.mp4 --cuda        # 使用 GPU 加速
 """
 
 import argparse
@@ -71,7 +72,7 @@ class TranscribeDisplay:
     def show_banner(self):
         banner = Text()
         banner.append("  🎙  Whisper 视频转录工具\n", style="bold bright_green")
-        banner.append("  ── Video → Text via OpenAI Whisper ──", style="dim bright_green")
+        banner.append("  ── Video → Text via faster-whisper (CTranslate2) ──", style="dim bright_green")
         panel = Panel(banner, border_style="bright_green", expand=False, padding=(0, 2))
         self.console.print(panel)
         self.console.print()
@@ -346,10 +347,10 @@ def transcribe_file(
         audio_mb = os.path.getsize(audio_path) / 1024 / 1024
         display.advance_file("识别中", f"音频 {audio_mb:.1f}MB")
 
-        # Step 2: Whisper 识别
-        result = model.transcribe(audio_path, language=language, verbose=False)
-        segments = result.get("segments", [])
-        detected_lang = result.get("language", language)
+        # Step 2: faster-whisper 识别
+        segments_iter, info = model.transcribe(audio_path, language=language, vad_filter=True)
+        segments = list(segments_iter)
+        detected_lang = (info.language if info.language else language) or language
 
         if not segments:
             display.advance_file("无内容", "未检测到语音")
@@ -359,7 +360,7 @@ def transcribe_file(
         def _cv(text):
             return converter.convert(text) if converter and text else text
 
-        text_lines = [_cv(seg["text"].strip()) for seg in segments if seg.get("text", "").strip()]
+        text_lines = [_cv(seg.text.strip()) for seg in segments if seg.text.strip()]
         tag = "→简" if converter else ""
         display.advance_file("保存", f"{len(segments)}段 lang={detected_lang} {tag}")
 
@@ -371,10 +372,10 @@ def transcribe_file(
         if "srt" in output_formats:
             srt_lines = []
             for i, seg in enumerate(segments, 1):
-                text = _cv(seg["text"].strip())
+                text = _cv(seg.text.strip())
                 if text:
                     srt_lines.append(
-                        f"{i}\n{_format_srt_time(seg['start'])} --> {_format_srt_time(seg['end'])}\n{text}\n"
+                        f"{i}\n{_format_srt_time(seg.start)} --> {_format_srt_time(seg.end)}\n{text}\n"
                     )
             srt_path.write_text("\n".join(srt_lines), encoding="utf-8")
             saved.append(srt_path.name)
@@ -423,7 +424,8 @@ def main():
             "示例:\n"
             "  python whisper_transcribe.py -d ./Downloaded/\n"
             "  python whisper_transcribe.py -f video.mp4 -m medium\n"
-            "  python whisper_transcribe.py -d ./Downloaded/ --srt --sc --skip-existing"
+            "  python whisper_transcribe.py -d ./Downloaded/ --srt --sc --skip-existing\n"
+            "  python whisper_transcribe.py -f video.mp4 --cuda  # GPU 加速"
         ),
     )
     parser.add_argument("-d", "--dir", default="./Downloaded", help="视频目录 (默认 ./Downloaded/)")
@@ -439,6 +441,7 @@ def main():
     parser.add_argument("--srt", action="store_true", help="同时输出SRT字幕")
     parser.add_argument("--skip-existing", action="store_true", help="跳过已有transcript的视频")
     parser.add_argument("--sc", action="store_true", help="繁体转简体 (需 pip install OpenCC)")
+    parser.add_argument("--cuda", action="store_true", help="使用 GPU 加速 (默认 CPU)")
     parser.add_argument(
         "-o",
         "--output",
@@ -461,11 +464,11 @@ def main():
     display.dep_ok("ffmpeg", ffmpeg_path)
 
     try:
-        import whisper
+        from faster_whisper import WhisperModel
     except ImportError:
-        display.dep_fail("openai-whisper", "pip install openai-whisper")
+        display.dep_fail("faster-whisper", "pip install faster-whisper")
         sys.exit(1)
-    display.dep_ok("whisper", "已安装")
+    display.dep_ok("faster-whisper", "已安装")
 
     converter = None
     if args.sc:
@@ -496,9 +499,11 @@ def main():
     display.info(f"找到 {len(videos)} 个视频")
 
     # ── 加载模型 ──
-    display.info(f"加载 Whisper 模型: [{THEME['model']}]{args.model}[/]  (首次需下载)")
-    model = whisper.load_model(args.model)
-    display.success(f"模型 [{THEME['model']}]{args.model}[/] 加载完成")
+    device = "cuda" if args.cuda else "cpu"
+    compute_type = "float16" if args.cuda else "int8"
+    display.info(f"加载 Whisper 模型: [{THEME['model']}]{args.model}[/] (设备: {device}, 首次需下载)")
+    model = WhisperModel(args.model, device=device, compute_type=compute_type)
+    display.success(f"模型 [{THEME['model']}]{args.model}[/] 加载完成 ({device}/{compute_type})")
     console.print()
 
     # ── 输出格式 ──
