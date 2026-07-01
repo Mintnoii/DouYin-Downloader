@@ -7,14 +7,13 @@ from pathlib import Path
 from typing import Any
 
 from auth import CookieManager
+from cli.login_flow import can_interactive_login, interactive_relogin
 from cli.progress_display import ProgressDisplay
 from config import ConfigLoader
 from control import QueueManager, RateLimiter, RetryHandler
 from control.sync_manager import SyncManager
 from control.sync_scheduler import SyncScheduler
-from core import DouyinAPIClient, DownloaderFactory, URLParser
-from core import LoginRequiredError
-from cli.login_flow import can_interactive_login, interactive_relogin
+from core import DouyinAPIClient, DownloaderFactory, LoginRequiredError, URLParser
 from storage import Database, FileManager
 from utils.logger import set_console_log_level, setup_logger
 from utils.notifier import build_notifier
@@ -108,6 +107,21 @@ async def download_url(
                 progress_reporter.update_step("解析链接", "URL 解析失败")
             display.print_error(f"Failed to parse URL: {url}")
             return None
+
+        # 当使用 --collect-ids 时，预取收藏夹名称映射以便按名称分目录存储
+        raw_collect_ids = config.get("collect_ids")
+        if raw_collect_ids and not config.get("collect_map"):
+            if isinstance(raw_collect_ids, str):
+                collect_ids = [cid.strip() for cid in raw_collect_ids.split(",") if cid.strip()]
+            elif isinstance(raw_collect_ids, (list, tuple, set)):
+                collect_ids = [str(cid).strip() for cid in raw_collect_ids if str(cid).strip()]
+            else:
+                collect_ids = []
+            if collect_ids:
+                if progress_reporter:
+                    progress_reporter.advance_step("获取收藏夹信息", "拉取收藏夹名称…")
+                collect_map = await _fetch_collect_map(api_client, collect_ids)
+                config.update(collect_map=collect_map)
 
         if not progress_reporter:
             display.print_info(f"URL type: {parsed['type']}")
@@ -227,6 +241,17 @@ async def main_async(args):
         await _run_sync_command(args, config)
         return
 
+    if args.list_collections:
+        await _run_list_collections(args, config)
+        return
+
+    if args.collect:
+        ok = await _run_interactive_collect(args, config)
+        if not ok:
+            return
+        # _run_interactive_collect 会设置 config 中的 collect_ids / collect_map
+        # 并自动插入 URL，然后继续走下面的下载流程
+
     if args.url:
         urls = args.url if isinstance(args.url, list) else [args.url]
         for url in urls:
@@ -235,6 +260,11 @@ async def main_async(args):
 
     if args.thread:
         config.update(thread=args.thread)
+
+    if args.collect_ids:
+        config.update(collect_ids=args.collect_ids)
+        # 使用 --collect-ids 时自动切换到 collect 模式
+        config.update(mode=["collect"])
 
     if not config.validate():
         display.print_error("Invalid configuration: missing required fields")
@@ -299,10 +329,7 @@ async def main_async(args):
 
         total_result = DownloadResult()
         for r in all_results:
-            total_result.total += r.total
-            total_result.success += r.success
-            total_result.failed += r.failed
-            total_result.skipped += r.skipped
+            total_result.merge(r)
 
         display.print_success("\n=== Overall Summary ===")
         display.show_result(total_result)
@@ -335,6 +362,264 @@ async def _run_discovery_subcommand(
                 max_items=int(args.search_max or 50),
             )
             display.print_success(f"搜索结果已保存：{result['count']} 条 -> {result['path']}")
+
+
+async def _run_interactive_collect(args, config: ConfigLoader) -> bool:
+    """交互式选择收藏夹下载。列出所有收藏夹后提示用户选择。
+
+    Returns ``True`` if the user selected at least one collection and config
+    was updated; ``False`` if the user cancelled or an error occurred.
+    """
+    cookies = config.get_cookies()
+    cookie_manager = CookieManager()
+    cookie_manager.set_cookies(cookies)
+
+    if not cookie_manager.validate_cookies():
+        display.print_warning("Cookie 可能无效或不完整，尝试继续…")
+
+    async with DouyinAPIClient(cookie_manager.get_cookies()) as api_client:
+        display.print_info("正在获取收藏夹列表…")
+        raw_collects = await _fetch_all_collects(api_client)
+        if not raw_collects:
+            display.print_warning("未找到任何收藏夹，请确认账号已登录且 cookie 有效")
+            return False
+
+        # 按名称排序
+        raw_collects.sort(
+            key=lambda c: (c.get("collects_name") or c.get("name") or "").lower()
+        )
+        max_id_len = max(
+            (len(str(_extract_collects_id_str(c))) for c in raw_collects),
+            default=0,
+        )
+
+        display.print_success(f"共 {len(raw_collects)} 个收藏夹：\n")
+        for i, item in enumerate(raw_collects, 1):
+            cid = _extract_collects_id_str(item)
+            cname = (
+                item.get("collects_name")
+                or item.get("name")
+                or item.get("title")
+                or "(未命名)"
+            )
+            count = _extract_collect_count(item)
+            display.print_info(
+                f"  {i:3d}.  [{cid:<{max_id_len}}]  {cname}  （{count} 个作品）"
+            )
+
+        # 读取用户选择
+        display.print_info(
+            "\n输入要下载的收藏夹编号（多个用逗号分隔，支持范围如 1-5，输入 all 全选）："
+        )
+        try:
+            raw = input("> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            display.print_warning("\n已取消")
+            return False
+
+        if not raw:
+            display.print_warning("未选择任何收藏夹，已取消")
+            return False
+
+        selected_indices = _parse_collect_selection(raw, len(raw_collects))
+        if not selected_indices:
+            display.print_warning("选择无效，已取消")
+            return False
+
+        # 构建 collect_ids 和 collect_map
+        selected_ids: list[str] = []
+        collect_map: dict[str, str] = {}
+        for idx in selected_indices:
+            item = raw_collects[idx]
+            cid = _extract_collects_id_str(item)
+            cname = (
+                item.get("collects_name")
+                or item.get("name")
+                or item.get("title")
+                or cid
+            )
+            if cid:
+                selected_ids.append(cid)
+                collect_map[cid] = cname
+
+        if not selected_ids:
+            display.print_warning("未能提取有效的收藏夹 ID")
+            return False
+
+        display.print_success(
+            f"已选择 {len(selected_ids)} 个收藏夹："
+            + ", ".join(collect_map.values())
+        )
+
+        # 写入 config
+        config.update(collect_ids=selected_ids, collect_map=collect_map, mode=["collect"])
+        # 自动添加收藏夹 URL（如果用户没通过 -u 指定）
+        if not config.get_links():
+            config.update(
+                link=["https://www.douyin.com/user/self?showTab=favorite_collection"]
+            )
+        return True
+
+
+def _parse_collect_selection(raw: str, total: int) -> list[int]:
+    """解析用户输入的收藏夹选择字符串，返回 0-based 索引列表。
+
+    支持格式：
+    - ``3``          → 第 3 个
+    - ``1,3,5``      → 第 1、3、5 个
+    - ``1-5``        → 第 1 到 5 个（含两端）
+    - ``1,3-5,8``    → 混合
+    - ``all`` / ``a`` → 全选
+    """
+    raw = raw.strip().lower()
+    if raw in ("all", "a"):
+        return list(range(total))
+
+    indices: set[int] = set()
+    parts = [p.strip() for p in raw.split(",") if p.strip()]
+    for part in parts:
+        if "-" in part:
+            range_parts = part.split("-", 1)
+            try:
+                start = int(range_parts[0]) - 1  # 1-based → 0-based
+                end = int(range_parts[1])  # inclusive, so no -1
+            except (ValueError, IndexError):
+                continue
+            if start < 0 or end > total or start >= end:
+                continue
+            indices.update(range(start, end))
+        else:
+            try:
+                idx = int(part) - 1  # 1-based → 0-based
+            except ValueError:
+                continue
+            if 0 <= idx < total:
+                indices.add(idx)
+
+    return sorted(indices)
+
+
+async def _run_list_collections(args, config: ConfigLoader) -> None:
+    """列出当前账号所有收藏夹（ID + 名称）。"""
+    cookies = config.get_cookies()
+    cookie_manager = CookieManager()
+    cookie_manager.set_cookies(cookies)
+
+    if not cookie_manager.validate_cookies():
+        display.print_warning("Cookie 可能无效或不完整，尝试继续…")
+
+    async with DouyinAPIClient(cookie_manager.get_cookies()) as api_client:
+        display.print_info("正在获取收藏夹列表…")
+        raw_collects = await _fetch_all_collects(api_client)
+        if not raw_collects:
+            display.print_warning("未找到任何收藏夹，请确认账号已登录且 cookie 有效")
+            return
+
+        display.print_success(f"共 {len(raw_collects)} 个收藏夹：\n")
+        # 按收藏夹名称排序（不区分大小写）
+        raw_collects.sort(key=lambda c: (c.get("collects_name") or c.get("name") or "").lower())
+        max_id_len = max(
+            (len(str(_extract_collects_id_str(c))) for c in raw_collects),
+            default=0,
+        )
+        for i, item in enumerate(raw_collects, 1):
+            cid = _extract_collects_id_str(item)
+            cname = (
+                item.get("collects_name")
+                or item.get("name")
+                or item.get("title")
+                or "(未命名)"
+            )
+            count = _extract_collect_count(item)
+            display.print_info(
+                f"  {i:3d}.  [{cid:<{max_id_len}}]  {cname}  （{count} 个作品）"
+            )
+
+        display.print_info(
+            "\n使用 --collect-ids 指定要下载的收藏夹，例如：\n"
+            f"  --collect-ids {_extract_collects_id_str(raw_collects[0])}"
+            if raw_collects
+            else ""
+        )
+
+
+async def _fetch_all_collects(api_client) -> list:
+    """分页拉取当前账号的所有收藏夹元数据。"""
+    all_items: list = []
+    cursor = 0
+    has_more = True
+    while has_more:
+        page = await api_client.get_user_collects("self", max_cursor=cursor, count=20)
+        items = page.get("items") or page.get("collects_list") or []
+        if not items:
+            break
+        all_items.extend(items)
+        has_more = bool(page.get("has_more", False))
+        next_cursor = int(page.get("max_cursor", 0) or 0)
+        if has_more and next_cursor == cursor:
+            break
+        cursor = next_cursor
+    return all_items
+
+
+def _extract_collects_id_str(item: dict) -> str:
+    """从收藏夹条目中提取 ID 字符串。
+
+    优先 ``collects_id_str`` — 抖音 API 返回的 ``collects_id`` 是 JS 数字，
+    超过 2⁵³ 后精度丢失，必须用字符串版本才能正确调用下游接口。
+    """
+    return str(
+        item.get("collects_id_str")
+        or item.get("collects_id")
+        or item.get("id")
+        or ((item.get("collects_info") or {}).get("collects_id_str"))
+        or ((item.get("collects_info") or {}).get("collects_id"))
+        or ""
+    )
+
+
+def _extract_collect_count(item: dict) -> str:
+    """从收藏夹条目中提取作品数量，尝试多个可能的字段名。
+
+    抖音 API 实际返回 ``total_number``（收藏夹列表接口）。
+    """
+    # 主字段（抖音实际返回的字段名）
+    for key in ("total_number", "total", "video_count", "aweme_count",
+                "count", "item_count", "collects_count", "media_count"):
+        val = item.get(key)
+        if val is not None and str(val).isdigit():
+            return str(val)
+    # 嵌套字段
+    for wrapper in ("collects_info", "extra", "stats"):
+        inner = item.get(wrapper)
+        if isinstance(inner, dict):
+            for key in ("total_number", "total", "video_count", "aweme_count",
+                        "count", "item_count"):
+                val = inner.get(key)
+                if val is not None and str(val).isdigit():
+                    return str(val)
+    return "?"
+
+
+async def _fetch_collect_map(api_client, collect_ids: list) -> dict:
+    """为给定的收藏夹 ID 列表获取 {id: name} 映射。"""
+    all_collects = await _fetch_all_collects(api_client)
+    id_to_name: dict = {}
+    for item in all_collects:
+        cid = _extract_collects_id_str(item)
+        if cid and cid in set(collect_ids):
+            name = (
+                item.get("collects_name")
+                or item.get("name")
+                or item.get("title")
+                or cid
+            )
+            id_to_name[cid] = name
+    # 补充 API 返回中未找到的 ID（可能用户手动指定了 ID）
+    for cid in collect_ids:
+        if cid not in id_to_name:
+            id_to_name[cid] = cid
+    return id_to_name
 
 
 async def _run_serve_subcommand(args, config: ConfigLoader) -> None:
@@ -521,6 +806,23 @@ def main():
     parser.add_argument("--sync", action="store_true", help="执行收藏夹同步")
     parser.add_argument("--sync-once", action="store_true", help="执行一次同步后退出")
     parser.add_argument("--sync-cron", type=str, help="设置同步的cron表达式")
+    parser.add_argument(
+        "--list-collections",
+        action="store_true",
+        help="列出当前账号所有收藏夹（ID 和名称）后退出",
+    )
+    parser.add_argument(
+        "--collect-ids",
+        type=str,
+        default=None,
+        metavar="ID1,ID2,...",
+        help="指定要下载的收藏夹 ID 列表（逗号分隔，仅 collect 模式有效）",
+    )
+    parser.add_argument(
+        "--collect",
+        action="store_true",
+        help="交互式选择要下载的收藏夹（列出所有收藏夹后提示选择）",
+    )
     try:
         from __init__ import __version__
     except ImportError:

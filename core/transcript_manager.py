@@ -1,6 +1,9 @@
+import asyncio
 import json
 import os
 import tempfile
+import time
+from functools import partial
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -89,6 +92,7 @@ class TranscriptManager:
         self.config = config
         self.file_manager = file_manager
         self.database = database
+        self._whisper_lock = asyncio.Lock()
 
     def _cfg(self) -> Dict[str, Any]:
         return self.config.get("transcript", {}) or {}
@@ -118,6 +122,32 @@ class TranscriptManager:
             return ["txt", "json"]
         normalized = [str(item).strip().lower() for item in formats if str(item).strip()]
         return normalized or ["txt", "json"]
+
+    def _backend(self) -> str:
+        """转录后端：``"whisper"``（本地 faster-whisper）或 ``"openai"``（云端 API）。"""
+        backend = str(self._cfg().get("backend", "whisper")).strip().lower()
+        if backend not in ("whisper", "openai"):
+            logger.warning("Unknown transcript backend %r, falling back to whisper", backend)
+            return "whisper"
+        return backend
+
+    def _whisper_model_size(self) -> str:
+        """本地 Whisper 模型大小：tiny / base / small / medium / large。"""
+        return str(self._cfg().get("whisper_model", "base")).strip() or "base"
+
+    def _whisper_device(self) -> str:
+        device = str(self._cfg().get("whisper_device", "cpu")).strip().lower()
+        if device not in ("cpu", "cuda"):
+            return "cpu"
+        return device
+
+    def _whisper_compute_type(self) -> str:
+        """faster-whisper compute_type：GPU 用 float16，CPU 用 int8。"""
+        return "float16" if self._whisper_device() == "cuda" else "int8"
+
+    def _language(self) -> Optional[str]:
+        lang = str(self._cfg().get("language", "zh")).strip()
+        return lang if lang else None
 
     def _resolve_api_key(self) -> str:
         """Resolve the API key per Requirement 5.6.
@@ -156,6 +186,38 @@ class TranscriptManager:
             )
             return video_dir
 
+    def _all_outputs_exist(self, text_path: Path, json_path: Path) -> bool:
+        """检查所有需要的转录输出文件是否已存在。"""
+        formats = set(self._response_formats())
+        checks = []
+        if "txt" in formats:
+            checks.append(text_path.is_file())
+        if "json" in formats:
+            checks.append(json_path.is_file())
+        return all(checks) if checks else True
+
+    def _get_opencc(self):
+        """Lazy-load OpenCC 繁体→简体转换器。"""
+        if hasattr(self, "_opencc_converter") and self._opencc_converter is not None:
+            return self._opencc_converter
+        try:
+            from opencc import OpenCC
+            self._opencc_converter = OpenCC("t2s")
+            logger.info("OpenCC t2s converter loaded")
+        except ImportError:
+            logger.warning("OpenCC not installed, skipping t→s conversion")
+            self._opencc_converter = False
+        return self._opencc_converter
+
+    @staticmethod
+    def _simplify_text(payload: Dict[str, Any], converter) -> Dict[str, Any]:
+        """将 payload 中的 text 和 segments 从繁体转为简体。"""
+        payload["text"] = converter.convert(payload.get("text", ""))
+        for seg in payload.get("segments", []):
+            if "text" in seg:
+                seg["text"] = converter.convert(seg["text"])
+        return payload
+
     def build_output_paths(self, video_path: Path) -> Tuple[Path, Path]:
         video_path = Path(video_path)
         output_dir = self.resolve_output_dir(video_path)
@@ -172,32 +234,34 @@ class TranscriptManager:
         if not self._enabled():
             return {"status": "skipped", "reason": "disabled"}
 
-        api_key = self._resolve_api_key()
+        backend = self._backend()
         text_path, json_path = self.build_output_paths(video_path)
-        model = self._model()
+        model = self._model() if backend == "openai" else self._whisper_model_size()
 
-        if not api_key:
-            await self._record_job(
-                aweme_id=aweme_id,
-                video_path=video_path,
-                transcript_dir=text_path.parent,
-                text_path=text_path,
-                json_path=json_path,
-                model=model,
-                status="skipped",
-                skip_reason="missing_api_key",
-                error_message=None,
-            )
-            logger.warning("Transcript skipped for aweme %s: missing_api_key", aweme_id)
-            return {"status": "skipped", "reason": "missing_api_key"}
+        # ── 增量检测：已有转录稿则跳过 ──────────────────────────────
+        if self._all_outputs_exist(text_path, json_path):
+            logger.info("Transcript already exists for aweme %s, skipping", aweme_id)
+            return {"status": "skipped", "reason": "already_exists"}
 
-        # ------------------------------------------------------------------
-        # Pick what to upload:
-        #   1. Source already audio (m4a/mp3/...): pass through (R1.8).
-        #   2. upload_audio_only=true (default): extract audio first (R1.1).
-        #   3. upload_audio_only=false: legacy behaviour, upload the video
-        #      file itself (R1.16 / R6.5).
-        # ------------------------------------------------------------------
+        # 本地 Whisper 不需要 API key；云端 OpenAI 需要
+        if backend == "openai":
+            api_key = self._resolve_api_key()
+            if not api_key:
+                await self._record_job(
+                    aweme_id=aweme_id,
+                    video_path=video_path,
+                    transcript_dir=text_path.parent,
+                    text_path=text_path,
+                    json_path=json_path,
+                    model=model,
+                    status="skipped",
+                    skip_reason="missing_api_key",
+                    error_message=None,
+                )
+                logger.warning("Transcript skipped for aweme %s: missing_api_key", aweme_id)
+                return {"status": "skipped", "reason": "missing_api_key"}
+
+        # ── 音频提取 ──────────────────────────────────────────────
         source_ext = video_path.suffix.lower()
         is_source_audio = source_ext in _SOURCE_AUDIO_MIME
         tmp_audio_dir: Optional[tempfile.TemporaryDirectory] = None
@@ -244,16 +308,31 @@ class TranscriptManager:
                 upload_filename = video_path.name
                 upload_content_type = _SOURCE_AUDIO_MIME[source_ext]
 
+            # ── 转录 ──────────────────────────────────────────────
+            t0 = time.monotonic()
             try:
-                payload = await self._call_openai_transcription(
-                    api_key=api_key,
-                    file_path=upload_path,
-                    filename=upload_filename,
-                    content_type=upload_content_type,
-                    model=model,
-                )
-                # ``_write_outputs`` re-derives the text from ``payload`` —
-                # no need to pre-extract it here.
+                if backend == "whisper":
+                    payload = await self._call_whisper_transcription(
+                        file_path=upload_path,
+                        model_size=model,
+                    )
+                else:
+                    payload = await self._call_openai_transcription(
+                        api_key=api_key,
+                        file_path=upload_path,
+                        filename=upload_filename,
+                        content_type=upload_content_type,
+                        model=model,
+                    )
+                elapsed = round(time.monotonic() - t0, 1)
+
+                # ── 繁体→简体（语言为 zh 时）─────────────────────────
+                lang = payload.get("language", "")
+                if lang == "zh" or (isinstance(lang, str) and lang.startswith("zh")):
+                    converter = self._get_opencc()
+                    if converter and converter is not False:
+                        payload = self._simplify_text(payload, converter)
+
                 await self._write_outputs(payload, text_path, json_path)
                 await self._record_job(
                     aweme_id=aweme_id,
@@ -270,6 +349,7 @@ class TranscriptManager:
                     "status": "success",
                     "text_path": str(text_path),
                     "json_path": str(json_path),
+                    "duration": elapsed,
                 }
             except Exception as exc:
                 error_message = str(exc)
@@ -287,24 +367,34 @@ class TranscriptManager:
                 logger.error(
                     "Transcript failed for aweme %s: %s", aweme_id, error_message
                 )
+                elapsed = round(time.monotonic() - t0, 1)
                 return {
                     "status": "failed",
                     "reason": "transcription_error",
                     "error": error_message,
+                    "duration": elapsed,
                 }
         finally:
             if tmp_audio_dir is not None:
-                # Cleanup is best-effort. R6.7: a cleanup error must not
-                # surface as a transcript task failure — log a WARNING and
-                # let the surrounding return path run.
                 try:
                     tmp_audio_dir.cleanup()
-                except Exception as exc:  # noqa: BLE001 — broad is correct here
+                except Exception as exc:
                     logger.warning(
                         "Failed to clean up transcript audio temp dir %s: %r",
                         tmp_audio_dir.name,
                         exc,
                     )
+
+    @staticmethod
+    def _to_writable_path(path: Path) -> str:
+        """将路径转为可写入的绝对路径字符串。
+
+        Windows 上通过 ``\\\\?\\`` 扩展前缀突破 MAX_PATH (260字符) 限制。
+        """
+        resolved = str(path.resolve())
+        if os.name == "nt" and not resolved.startswith("\\\\?\\"):
+            resolved = "\\\\?\\" + resolved
+        return resolved
 
     async def _write_outputs(
         self, payload: Dict[str, Any], text_path: Path, json_path: Path
@@ -313,11 +403,13 @@ class TranscriptManager:
 
         if "txt" in formats:
             text = str(payload.get("text", "")).strip()
-            async with aiofiles.open(text_path, "w", encoding="utf-8") as f:
+            write_path = self._to_writable_path(text_path)
+            async with aiofiles.open(write_path, "w", encoding="utf-8") as f:
                 await f.write(text)
 
         if "json" in formats:
-            async with aiofiles.open(json_path, "w", encoding="utf-8") as f:
+            write_path = self._to_writable_path(json_path)
+            async with aiofiles.open(write_path, "w", encoding="utf-8") as f:
                 await f.write(json.dumps(payload, ensure_ascii=False, indent=2))
 
     async def _call_openai_transcription(
@@ -380,6 +472,78 @@ class TranscriptManager:
                     if not isinstance(payload, dict):
                         raise RuntimeError("OpenAI transcription returned invalid payload")
                     return payload
+
+    # ── Local Whisper backend ────────────────────────────────────────
+
+    def _get_whisper_model(self):
+        """Lazy-load and cache the faster-whisper model."""
+        if hasattr(self, "_whisper") and self._whisper is not None:
+            return self._whisper
+
+        from faster_whisper import WhisperModel
+
+        size = self._whisper_model_size()
+        device = self._whisper_device()
+        compute = self._whisper_compute_type()
+        logger.info(
+            "Loading Whisper model: %s (device=%s, compute=%s)", size, device, compute
+        )
+        self._whisper = WhisperModel(size, device=device, compute_type=compute)
+        return self._whisper
+
+    async def _call_whisper_transcription(
+        self, *, file_path: Path, model_size: str
+    ) -> Dict[str, Any]:
+        """Transcribe audio with local faster-whisper, returning an
+        OpenAI-compatible payload dict so ``_write_outputs`` works unchanged.
+        """
+        if not file_path.exists():
+            raise FileNotFoundError(f"Audio file not found: {file_path}")
+
+        # 本地 Whisper 模型不支持并发调用（CTranslate2 非线程安全），
+        # 使用 asyncio.Lock 确保同一时间只有一个转录任务在执行。
+        async with self._whisper_lock:
+            model = self._get_whisper_model()
+            language = self._language()
+
+            _run = partial(
+                model.transcribe,
+                str(file_path),
+                language=language,
+                vad_filter=True,
+            )
+            loop = asyncio.get_running_loop()
+            segments_iter, info = await loop.run_in_executor(None, _run)
+            segments = list(segments_iter)
+        detected_lang = info.language if info and info.language else (language or "zh")
+
+        logger.info(
+            "Whisper transcribed %d segments, detected lang=%s",
+            len(segments),
+            detected_lang,
+        )
+
+        text = "".join(
+            (seg.text or "").strip() + ("\n" if i < len(segments) - 1 else "")
+            for i, seg in enumerate(segments)
+        ).strip()
+
+        # Build OpenAI-compatible payload so _write_outputs + _record_job
+        # don't need to know which backend ran.
+        return {
+            "text": text,
+            "model": f"whisper-{model_size}",
+            "language": detected_lang,
+            "segments": [
+                {
+                    "id": i,
+                    "start": round(seg.start, 3),
+                    "end": round(seg.end, 3),
+                    "text": (seg.text or "").strip(),
+                }
+                for i, seg in enumerate(segments)
+            ],
+        }
 
     @staticmethod
     def _guess_video_content_type(video_path: Path) -> str:

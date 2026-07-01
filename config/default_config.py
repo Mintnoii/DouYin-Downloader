@@ -52,7 +52,17 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     },
     "transcript": {
         "enabled": False,
+        # 转录后端："whisper"（本地 faster-whisper，免费，默认）或
+        # "openai"（云端 OpenAI 兼容 API，需 API key）。
+        "backend": "whisper",
+        # openai 后端使用的模型名（如 gpt-4o-mini-transcribe）
         "model": "gpt-4o-mini-transcribe",
+        # whisper 后端使用的模型大小：tiny / base / small / medium / large
+        "whisper_model": "base",
+        # whisper 后端设备：cpu 或 cuda
+        "whisper_device": "cpu",
+        # 音频语言（空 = 自动检测）
+        "language": "zh",
         "output_dir": "",
         "response_formats": ["txt", "json"],
         "api_url": "https://api.openai.com/v1/audio/transcriptions",

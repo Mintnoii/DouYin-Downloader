@@ -38,6 +38,68 @@ class DownloadResult:
         self.success = 0
         self.failed = 0
         self.skipped = 0
+        # 转录统计
+        self.transcript_success = 0
+        self.transcript_failed = 0
+        self.transcript_skipped = 0
+        # 转录跳过原因（reason → count）
+        self.transcript_skip_reasons: Dict[str, int] = {}
+        # 转录失败原因（error 摘要 → count）
+        self.transcript_fail_reasons: Dict[str, int] = {}
+        # 异常明细（下载或转录非成功时记录）
+        self.issues: List[Dict[str, Any]] = []
+
+    def add_transcript_skip(self, reason: str) -> None:
+        self.transcript_skipped += 1
+        self.transcript_skip_reasons[reason] = self.transcript_skip_reasons.get(reason, 0) + 1
+
+    def add_transcript_fail(self, reason: str) -> None:
+        self.transcript_failed += 1
+        self.transcript_fail_reasons[reason] = self.transcript_fail_reasons.get(reason, 0) + 1
+
+    def add_transcript_success(self) -> None:
+        self.transcript_success += 1
+
+    def add_issue(
+        self,
+        aweme_id: str,
+        desc: str,
+        *,
+        download: Optional[str] = None,
+        download_duration: Optional[float] = None,
+        transcript: Optional[str] = None,
+        transcript_reason: str = "",
+        transcript_duration: Optional[float] = None,
+    ) -> None:
+        """记录一条异常项。
+
+        ``download``: 下载状态 ``"skipped"`` / ``"failed"``（成功则为 None）。
+        ``transcript``: 转录状态 ``"skipped"`` / ``"failed"``（成功或无转录为 None）。
+        """
+        self.issues.append({
+            "aweme_id": aweme_id,
+            "desc": desc,
+            "download": download,
+            "download_duration": download_duration,
+            "transcript": transcript,
+            "transcript_reason": transcript_reason,
+            "transcript_duration": transcript_duration,
+        })
+
+    def merge(self, other: "DownloadResult") -> None:
+        """将另一个 DownloadResult 的统计合并到当前实例。"""
+        self.total += other.total
+        self.success += other.success
+        self.failed += other.failed
+        self.skipped += other.skipped
+        self.transcript_success += other.transcript_success
+        self.transcript_failed += other.transcript_failed
+        self.transcript_skipped += other.transcript_skipped
+        for k, v in other.transcript_skip_reasons.items():
+            self.transcript_skip_reasons[k] = self.transcript_skip_reasons.get(k, 0) + v
+        for k, v in other.transcript_fail_reasons.items():
+            self.transcript_fail_reasons[k] = self.transcript_fail_reasons.get(k, 0) + v
+        self.issues.extend(other.issues)
 
     def __str__(self):
         return f"Total: {self.total}, Success: {self.success}, Failed: {self.failed}, Skipped: {self.skipped}"
@@ -68,6 +130,7 @@ class BaseDownloader(ABC):
         self.progress_reporter = progress_reporter
         self.metadata_handler = MetadataHandler()
         self.transcript_manager = TranscriptManager(self.config, self.file_manager, self.database)
+        self._transcript_results: Dict[str, Dict[str, Any]] = {}
         self._local_aweme_ids: Optional[set[str]] = None
         self._aweme_id_pattern = re.compile(r"(?<!\d)(\d{15,20})(?!\d)")
         self._local_media_suffixes = {
@@ -480,10 +543,12 @@ class BaseDownloader(ABC):
             self.file_manager.base_path, manifest_record
         )
 
+        transcript_result = None
         if media_type == "video" and video_path is not None:
             transcript_result = await self.transcript_manager.process_video(
                 video_path, aweme_id=aweme_id
             )
+            self._transcript_results[str(aweme_id)] = transcript_result
             transcript_status = transcript_result.get("status")
             if transcript_status == "skipped":
                 logger.info(

@@ -1,12 +1,50 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Set
+import time
+from typing import Any, Dict, List, Optional, Set, Union
 
 from core.downloader_base import BaseDownloader, DownloadResult
 from core.user_mode_registry import UserModeRegistry
 from utils.logger import setup_logger
 
 logger = setup_logger("UserDownloader")
+
+
+def _transcript_fail_label(transcript: Dict[str, Any]) -> str:
+    """从转录结果中提取简短的失败原因标签。"""
+    reason = transcript.get("reason", "")
+    if reason:
+        return reason
+    error = str(transcript.get("error", ""))
+    # 按常见错误特征归类
+    if "ffmpeg" in error.lower() or "extract" in error.lower():
+        return "audio_extract_failed"
+    if "whisper" in error.lower() or "model" in error.lower():
+        return "whisper_error"
+    if "timeout" in error.lower():
+        return "timeout"
+    return "transcription_error"
+
+
+def _normalise_collect_ids(raw: Union[str, List[str], None]) -> List[str]:
+    """Accept comma-separated string or list, return a deduplicated list of
+    non-empty collection IDs."""
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        ids = [cid.strip() for cid in raw.split(",") if cid.strip()]
+    elif isinstance(raw, (list, tuple, set)):
+        ids = [str(cid).strip() for cid in raw if str(cid).strip()]
+    else:
+        return []
+    # Preserve insertion order while deduplicating.
+    seen: set[str] = set()
+    result: List[str] = []
+    for cid in ids:
+        if cid not in seen:
+            seen.add(cid)
+            result.append(cid)
+    return result
 
 
 class UserDownloader(BaseDownloader):
@@ -68,10 +106,7 @@ class UserDownloader(BaseDownloader):
             mode_result = await strategy.download_mode(
                 sec_uid, user_info, seen_aweme_ids=seen_aweme_ids
             )
-            result.total += mode_result.total
-            result.success += mode_result.success
-            result.failed += mode_result.failed
-            result.skipped += mode_result.skipped
+            result.merge(mode_result)
 
         return result
 
@@ -91,11 +126,13 @@ class UserDownloader(BaseDownloader):
             # an empty DownloadResult, which the JobManager renders as
             # the silent "已完成 0 项" failure.
             collects_id = (str(self.config.get("collects_id") or "")).strip()
-            if not collects_id:
+            collect_ids = self.config.get("collect_ids")
+            if not collects_id and not collect_ids:
                 logger.error(
                     "Modes collect/collectmix only support "
                     "/user/self?showTab=favorite_collection or "
-                    "my-content 下载本收藏夹 (collects_id required)"
+                    "my-content 下载本收藏夹 (collects_id required), "
+                    "or --collect-ids to select specific collections"
                 )
                 return False
         if has_collect_mode and has_regular_mode:
@@ -176,10 +213,11 @@ class UserDownloader(BaseDownloader):
         return strategy
 
     def _make_collect_strategy(self):
-        """Construct the collect strategy, threading ``collects_id`` from
-        the per-job config when present. Caches only the no-filter path
-        (matching the historic CLI behaviour) so a subsequent call with a
-        different filter doesn't pick up a stale binding.
+        """Construct the collect strategy, threading ``collects_id`` or
+        ``collect_ids`` from the per-job config when present. Caches only
+        the no-filter path (matching the historic CLI behaviour) so a
+        subsequent call with a different filter doesn't pick up a stale
+        binding.
         """
         strategy_cls = self.mode_registry.get("collect")
         if strategy_cls is None:
@@ -187,6 +225,18 @@ class UserDownloader(BaseDownloader):
 
         raw_filter = self.config.get("collects_id")
         collects_id = (str(raw_filter).strip() if raw_filter is not None else "") or None
+
+        # Multi-collection mode: a list of IDs with optional name map.
+        raw_ids = self.config.get("collect_ids")
+        if raw_ids and not collects_id:
+            collect_ids = _normalise_collect_ids(raw_ids)
+            collect_map = self.config.get("collect_map") or {}
+            if isinstance(collect_map, dict):
+                collect_map = {str(k): str(v) for k, v in collect_map.items()}
+            else:
+                collect_map = {}
+            # Multi-collection strategy is request-scoped — never cached.
+            return strategy_cls(self, collect_ids=collect_ids, collect_map=collect_map)
 
         if collects_id is None:
             cached = self._mode_strategy_cache.get("collect")
@@ -196,7 +246,7 @@ class UserDownloader(BaseDownloader):
             self._mode_strategy_cache["collect"] = strategy
             return strategy
 
-        # Filtered path is request-scoped — never cached.
+        # Single-folder filter path is request-scoped — never cached.
         return strategy_cls(self, collects_id=collects_id)
 
     async def _download_mode_items(
@@ -231,19 +281,26 @@ class UserDownloader(BaseDownloader):
         db_batch: Optional[List[Dict[str, Any]]] = [] if self.database else None
 
         async def _process_aweme(item: Dict[str, Any]):
-            aweme_id = item.get("aweme_id")
-            if not await self._should_download(str(aweme_id or "")):
-                self._progress_advance_item("skipped", str(aweme_id or "unknown"))
-                return {"status": "skipped", "aweme_id": aweme_id}
+            aweme_id = str(item.get("aweme_id") or "")
+            desc = (item.get("desc") or "").strip() or aweme_id
+            if not await self._should_download(aweme_id):
+                self._progress_advance_item("skipped", aweme_id)
+                return {"status": "skipped", "aweme_id": aweme_id, "desc": desc}
 
+            dl_t0 = time.monotonic()
             success = await self._download_aweme_assets(
                 item, author_name, mode=mode, db_batch=db_batch
             )
+            dl_elapsed = round(time.monotonic() - dl_t0, 1)
             status = "success" if success else "failed"
-            self._progress_advance_item(status, str(aweme_id or "unknown"))
+            self._progress_advance_item(status, aweme_id)
+            transcript = self._transcript_results.pop(aweme_id, None)
             return {
                 "status": status,
                 "aweme_id": aweme_id,
+                "desc": desc,
+                "transcript": transcript,
+                "download_duration": dl_elapsed,
             }
 
         download_results = await self.queue_manager.download_batch(_process_aweme, deduped_items)
@@ -252,16 +309,50 @@ class UserDownloader(BaseDownloader):
             await self.database.add_aweme_batch(db_batch)
 
         for entry in download_results:
-            status = entry.get("status") if isinstance(entry, dict) else None
+            entry = entry if isinstance(entry, dict) else {}
+            status = entry.get("status")
+            aweme_id = str(entry.get("aweme_id") or "")
+            desc = str(entry.get("desc") or aweme_id)
+            dl_dur = entry.get("download_duration")
+
             if status == "success":
                 result.success += 1
             elif status == "failed":
                 result.failed += 1
+                result.add_issue(aweme_id, desc, download="failed", download_duration=dl_dur)
             elif status == "skipped":
                 result.skipped += 1
+                result.add_issue(aweme_id, desc, download="skipped")
             else:
                 result.failed += 1
                 self._progress_advance_item("failed", "unknown")
+                result.add_issue(aweme_id, desc, download="failed")
+
+            # 累积转录统计 + 异常明细
+            transcript = entry.get("transcript") if isinstance(entry, dict) else None
+            if isinstance(transcript, dict):
+                t_status = transcript.get("status")
+                t_dur = transcript.get("duration")
+                if t_status == "success":
+                    result.add_transcript_success()
+                elif t_status == "skipped":
+                    reason = transcript.get("reason", "unknown")
+                    result.add_transcript_skip(reason)
+                    result.add_issue(
+                        aweme_id, desc,
+                        download=None if status == "success" else status,
+                        transcript="skipped", transcript_reason=reason,
+                        transcript_duration=t_dur,
+                    )
+                elif t_status == "failed":
+                    reason = _transcript_fail_label(transcript)
+                    result.add_transcript_fail(reason)
+                    result.add_issue(
+                        aweme_id, desc,
+                        download=None if status == "success" else status,
+                        transcript="failed", transcript_reason=reason,
+                        transcript_duration=t_dur,
+                    )
 
         return result
 

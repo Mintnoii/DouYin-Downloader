@@ -226,6 +226,16 @@ class ProgressDisplay:
                 detail=f"共 {self._item_total} 个作品",
             )
 
+    _TRANSCRIPT_REASON_LABELS = {
+        "already_exists": "已存在",
+        "disabled": "已禁用",
+        "missing_api_key": "缺少 API Key",
+        "audio_extract_failed": "音频提取失败",
+        "transcription_error": "转录错误",
+        "whisper_error": "Whisper 错误",
+        "timeout": "超时",
+    }
+
     def show_result(self, result):
         table = Table(title="Download Summary", show_header=True, header_style="bold magenta")
         table.add_column("Metric", style="cyan")
@@ -240,7 +250,58 @@ class ProgressDisplay:
             success_rate = (result.success / result.total) * 100
             table.add_row("Success Rate", f"{success_rate:.1f}%")
 
+        # ── 转录统计 ──────────────────────────────────────────────
+        t_total = result.transcript_success + result.transcript_failed + result.transcript_skipped
+        if t_total > 0:
+            table.add_section()
+            table.add_row("[bold]─ Transcript ─[/bold]", "")
+            table.add_row("  Success", str(result.transcript_success))
+            table.add_row("  Failed", str(result.transcript_failed))
+            for reason, count in sorted(result.transcript_fail_reasons.items()):
+                label = self._TRANSCRIPT_REASON_LABELS.get(reason, reason)
+                table.add_row(f"    ├ {label}", str(count))
+            table.add_row("  Skipped", str(result.transcript_skipped))
+            for reason, count in sorted(result.transcript_skip_reasons.items()):
+                label = self._TRANSCRIPT_REASON_LABELS.get(reason, reason)
+                table.add_row(f"    ├ {label}", str(count))
+
         self._active_console().print(table)
+
+        # ── 异常明细 ──────────────────────────────────────────────
+        if result.issues:
+            console = self._active_console()
+            console.print()
+            console.print("[bold yellow]⚠ Issues:[/bold yellow]")
+            for issue in result.issues:
+                self._print_issue(console, issue)
+
+    def _print_issue(self, console, issue: dict) -> None:
+        desc = issue.get("desc", issue.get("aweme_id", "?"))
+        download = issue.get("download")
+        transcript = issue.get("transcript")
+        transcript_reason = issue.get("transcript_reason", "")
+        dl_dur = issue.get("download_duration")
+        t_dur = issue.get("transcript_duration")
+
+        # 下载状态标签
+        dl_tag = ""
+        if download == "failed":
+            dur_str = f" ({dl_dur:.1f}s)" if dl_dur is not None else ""
+            dl_tag = f" [red]下载失败{dur_str}[/red]"
+        elif download == "skipped":
+            dl_tag = " [dim]下载跳过[/dim]"
+
+        # 转录状态标签
+        t_tag = ""
+        if transcript:
+            label = self._TRANSCRIPT_REASON_LABELS.get(transcript_reason, transcript_reason)
+            dur_str = f" ({t_dur:.1f}s)" if t_dur is not None else ""
+            if transcript == "failed":
+                t_tag = f" [red]转录失败: {label}{dur_str}[/red]"
+            elif transcript == "skipped":
+                t_tag = f" [dim]转录跳过: {label}[/dim]"
+
+        console.print(f"  {desc}{dl_tag}{t_tag}")
 
     def print_info(self, message: str):
         self._active_console().print(f"[blue][INFO][/blue] {message}")
