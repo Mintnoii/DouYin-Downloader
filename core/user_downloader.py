@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import time
 from typing import Any, Dict, List, Optional, Set, Union
 
@@ -273,37 +274,122 @@ class UserDownloader(BaseDownloader):
 
         result = DownloadResult()
         result.total = len(deduped_items)
-        self._progress_set_item_total(result.total, "作品待下载")
+
+        # ── 转录流水线：独立消费者，下载完成后不阻塞槽位 ────────────
+        transcript_cfg = self.config.get("transcript", {}) or {}
+        transcription_enabled = bool(transcript_cfg.get("enabled", False))
+        transcribe_queue: Optional[asyncio.Queue] = None
+        consumer_task: Optional[asyncio.Task] = None
+        transcribe_stats = {"done": 0, "total": 0}
+
+        # 进度条 total = 下载 + 转录（各占一半），display_total 保持实际作品数
+        if transcription_enabled:
+            item_total = result.total * 2 if result.total > 0 else 1
+            self._progress_set_item_total(item_total, "作品待下载", display_total=result.total)
+        else:
+            self._progress_set_item_total(result.total, "作品待下载")
         self._progress_update_step("下载作品", f"待处理 {result.total} 条")
 
         # Accumulate per-aweme DB records and flush in a single transaction
         # at the end — avoids one fsync per item across the whole batch.
         db_batch: Optional[List[Dict[str, Any]]] = [] if self.database else None
 
+        if transcription_enabled:
+            transcribe_queue = asyncio.Queue()
+
+            async def _transcribe_consumer():
+                while True:
+                    item = await transcribe_queue.get()
+                    if item is None:  # sentinel — 全部下载已入队
+                        transcribe_queue.task_done()
+                        break
+                    video_path, aweme_id = item
+                    try:
+                        result = await self.transcript_manager.process_video(
+                            video_path, aweme_id=aweme_id
+                        )
+                    except Exception as exc:
+                        result = {
+                            "status": "failed",
+                            "reason": "transcription_error",
+                            "error": str(exc),
+                        }
+                    self._transcript_results[str(aweme_id)] = result
+                    transcribe_stats["done"] += 1
+                    # 推送转录进度（不影响下载 S/F/K 统计）
+                    self._progress_advance_transcribe(aweme_id)
+                    if transcribe_stats["total"] > 0:
+                        self._progress_update_step(
+                            "转录作品",
+                            f"转录中 {transcribe_stats['done']}/{transcribe_stats['total']}",
+                        )
+                    t_status = result.get("status")
+                    if t_status == "skipped":
+                        logger.info(
+                            "Transcript skipped for aweme %s: %s",
+                            aweme_id,
+                            result.get("reason", "unknown"),
+                        )
+                    elif t_status == "failed":
+                        logger.warning(
+                            "Transcript failed for aweme %s: %s",
+                            aweme_id,
+                            result.get("error", "unknown"),
+                        )
+                    transcribe_queue.task_done()
+
+            consumer_task = asyncio.ensure_future(_transcribe_consumer())
+
         async def _process_aweme(item: Dict[str, Any]):
             aweme_id = str(item.get("aweme_id") or "")
             desc = (item.get("desc") or "").strip() or aweme_id
             if not await self._should_download(aweme_id):
                 self._progress_advance_item("skipped", aweme_id)
+                # 视频已下载但转录未完成时，仍然推入转录队列
+                if transcription_enabled and self._detect_media_type(item) == "video":
+                    local_video = self._find_local_media_by_aweme_id(aweme_id)
+                    if local_video is not None and transcribe_queue is not None:
+                        # 先检查转录是否已存在，避免重复入队
+                        txt_path, _ = self.transcript_manager.build_output_paths(local_video)
+                        if not txt_path.is_file():
+                            await transcribe_queue.put((local_video, aweme_id))
+                            transcribe_stats["total"] += 1
+                            logger.info(
+                                "已下载视频 %s 推入转录队列: %s", aweme_id, local_video.name,
+                            )
                 return {"status": "skipped", "aweme_id": aweme_id, "desc": desc}
 
+            is_video = self._detect_media_type(item) == "video"
             dl_t0 = time.monotonic()
             success = await self._download_aweme_assets(
-                item, author_name, mode=mode, db_batch=db_batch
+                item, author_name, mode=mode, db_batch=db_batch,
+                transcribe=False,
+                transcribe_queue=transcribe_queue,
             )
             dl_elapsed = round(time.monotonic() - dl_t0, 1)
             status = "success" if success else "failed"
             self._progress_advance_item(status, aweme_id)
-            transcript = self._transcript_results.pop(aweme_id, None)
+            if success and transcription_enabled and is_video:
+                transcribe_stats["total"] += 1
             return {
                 "status": status,
                 "aweme_id": aweme_id,
                 "desc": desc,
-                "transcript": transcript,
                 "download_duration": dl_elapsed,
             }
 
         download_results = await self.queue_manager.download_batch(_process_aweme, deduped_items)
+
+        # ── 等待转录全部完成 ────────────────────────────────────────
+        if consumer_task is not None:
+            transcribe_count = transcribe_stats["total"]
+            self._progress_update_step(
+                "转录作品",
+                f"下载完成，开始转录 {transcribe_count} 个视频...",
+            )
+            await transcribe_queue.put(None)   # 发送 sentinel
+            await consumer_task                # 等待消费者退出
+            self._progress_update_step("转录作品", "转录完成")
 
         if db_batch:
             await self.database.add_aweme_batch(db_batch)
@@ -329,7 +415,7 @@ class UserDownloader(BaseDownloader):
                 result.add_issue(aweme_id, desc, download="failed")
 
             # 累积转录统计 + 异常明细
-            transcript = entry.get("transcript") if isinstance(entry, dict) else None
+            transcript = self._transcript_results.pop(aweme_id, None)
             if isinstance(transcript, dict):
                 t_status = transcript.get("status")
                 t_dur = transcript.get("duration")
@@ -343,15 +429,18 @@ class UserDownloader(BaseDownloader):
                         download=None if status == "success" else status,
                         transcript="skipped", transcript_reason=reason,
                         transcript_duration=t_dur,
+                        transcript_error=str(transcript.get("error", "")),
                     )
                 elif t_status == "failed":
                     reason = _transcript_fail_label(transcript)
+                    error_msg = str(transcript.get("error", "") or "")
                     result.add_transcript_fail(reason)
                     result.add_issue(
                         aweme_id, desc,
                         download=None if status == "success" else status,
                         transcript="failed", transcript_reason=reason,
                         transcript_duration=t_dur,
+                        transcript_error=error_msg,
                     )
 
         return result

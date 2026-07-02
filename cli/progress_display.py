@@ -30,12 +30,12 @@ class ProgressDisplay:
         self._progress: Optional[Progress] = None
         self._overall_task_id: Optional[int] = None
         self._url_task_id: Optional[int] = None
-        self._item_task_id: Optional[int] = None
         self._url_index = 0
         self._url_total = 0
         self._url_step_completed = 0
         self._item_total = 0
         self._item_completed = 0
+        self._display_item_total: Optional[int] = None  # 用于显示"共 N 个作品"，与进度 total 解耦
         self._single_url_item_mode = False
         self._item_stats = {"success": 0, "failed": 0, "skipped": 0}
 
@@ -160,12 +160,13 @@ class ProgressDisplay:
             detail=detail,
         )
 
-    def set_item_total(self, total: int, detail: str = ""):
+    def set_item_total(self, total: int, detail: str = "", display_total: Optional[int] = None):
         if not self._progress:
             return
 
         self._item_total = max(total, 1)
         self._item_completed = 1 if total == 0 else 0
+        self._display_item_total = display_total  # None 表示与 total 相同
         self._item_stats = {"success": 0, "failed": 0, "skipped": 0}
 
         if self._url_total == 1 and self._overall_task_id is not None:
@@ -174,56 +175,64 @@ class ProgressDisplay:
                 self._overall_task_id,
                 total=self._item_total,
                 completed=self._item_completed,
-                detail=f"共 {total} 个作品",
+                detail=self._overall_item_detail(),
             )
 
-        description = self._format_item_description()
-        item_detail = detail or ("无待下载条目" if total == 0 else "")
-
-        if self._item_task_id is None:
-            self._item_task_id = self._progress.add_task(
-                description,
-                total=self._item_total,
-                completed=self._item_completed,
-                detail=item_detail,
-            )
-            return
-
-        self._progress.update(
-            self._item_task_id,
-            total=self._item_total,
-            completed=self._item_completed,
-            description=description,
-            detail=item_detail,
-        )
+    def _overall_item_detail(self) -> str:
+        """返回总体进度条中显示数量的文本，与进度 total 解耦。"""
+        if self._display_item_total is not None:
+            n = self._display_item_total
+            return f"共 {n} 个视频 + {n} 个文稿"
+        return f"共 {self._item_total} 个作品"
 
     def advance_item(self, status: str, detail: str = ""):
         if not self._progress:
             return
-        if self._item_task_id is None:
-            self.set_item_total(1, "初始化条目进度")
-        assert self._item_task_id is not None
 
         if status in self._item_stats:
             self._item_stats[status] += 1
         if self._item_completed < self._item_total:
             self._item_completed += 1
 
-        status_map = {"success": "成功", "failed": "失败", "skipped": "跳过"}
-        status_text = status_map.get(status, status)
-        item_detail = f"最近: {status_text} {self._shorten(detail, max_len=36)}"
-
-        self._progress.update(
-            self._item_task_id,
-            completed=self._item_completed,
-            description=self._format_item_description(),
-            detail=item_detail,
-        )
         if self._single_url_item_mode and self._overall_task_id is not None:
             self._progress.update(
                 self._overall_task_id,
                 completed=self._item_completed,
-                detail=f"共 {self._item_total} 个作品",
+                detail=self._overall_item_detail(),
+            )
+
+    def extend_item_total(self, additional: int, detail: str = ""):
+        """Increase the item total without resetting completed count.
+
+        Used when transcription work extends the original download-only total,
+        so the progress bar reflects download + transcription as one continuum.
+        """
+        if not self._progress or additional <= 0:
+            return
+        self._item_total += additional
+        if self._single_url_item_mode and self._overall_task_id is not None:
+            self._progress.update(
+                self._overall_task_id,
+                total=self._item_total,
+                completed=self._item_completed,
+                detail=self._overall_item_detail(),
+            )
+
+    def advance_progress(self, detail: str = ""):
+        """Advance the overall progress bar without affecting S/F/K stats.
+
+        Used for transcription completions so they move the progress bar
+        but don't pollute the download counters.
+        """
+        if not self._progress:
+            return
+        if self._item_completed < self._item_total:
+            self._item_completed += 1
+        if self._single_url_item_mode and self._overall_task_id is not None:
+            self._progress.update(
+                self._overall_task_id,
+                completed=self._item_completed,
+                detail=self._overall_item_detail(),
             )
 
     _TRANSCRIPT_REASON_LABELS = {
@@ -280,6 +289,7 @@ class ProgressDisplay:
         download = issue.get("download")
         transcript = issue.get("transcript")
         transcript_reason = issue.get("transcript_reason", "")
+        transcript_error = issue.get("transcript_error", "")
         dl_dur = issue.get("download_duration")
         t_dur = issue.get("transcript_duration")
 
@@ -297,7 +307,8 @@ class ProgressDisplay:
             label = self._TRANSCRIPT_REASON_LABELS.get(transcript_reason, transcript_reason)
             dur_str = f" ({t_dur:.1f}s)" if t_dur is not None else ""
             if transcript == "failed":
-                t_tag = f" [red]转录失败: {label}{dur_str}[/red]"
+                error_suffix = f": {transcript_error}" if transcript_error else ""
+                t_tag = f" [red]转录失败: {label}{dur_str}{error_suffix}[/red]"
             elif transcript == "skipped":
                 t_tag = f" [dim]转录跳过: {label}[/dim]"
 
@@ -318,26 +329,13 @@ class ProgressDisplay:
     def _cleanup_url_tasks(self):
         if not self._progress:
             self._url_task_id = None
-            self._item_task_id = None
             return
-
-        if self._item_task_id is not None:
-            self._progress.remove_task(self._item_task_id)
-            self._item_task_id = None
         if self._url_task_id is not None:
             self._progress.remove_task(self._url_task_id)
             self._url_task_id = None
 
     def _format_url_description(self, step: str) -> str:
         return f"URL {self._url_index}/{self._url_total} · {step}"
-
-    def _format_item_description(self) -> str:
-        return (
-            "作品下载 "
-            f"S:{self._item_stats['success']} "
-            f"F:{self._item_stats['failed']} "
-            f"K:{self._item_stats['skipped']}"
-        )
 
     def _active_console(self) -> Console:
         if self._progress:

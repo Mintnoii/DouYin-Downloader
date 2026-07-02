@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import sys
 import tempfile
 import time
 from functools import partial
@@ -272,12 +273,21 @@ class TranscriptManager:
 
         try:
             if not is_source_audio and self._upload_audio_only():
+                logger.info(
+                    "🔊 提取音频: %s → mp3 (ffmpeg)", video_path.name,
+                )
+                t_extract = time.monotonic()
                 tmp_audio_dir = tempfile.TemporaryDirectory(
                     prefix="transcript_audio_"
                 )
                 try:
                     upload_path = await extract_audio(
                         video_path, Path(tmp_audio_dir.name)
+                    )
+                    logger.info(
+                        "🔊 音频提取完成 (%.1fs): %s",
+                        time.monotonic() - t_extract,
+                        upload_path.name,
                     )
                 except AudioExtractError as exc:
                     error_message = str(exc)
@@ -478,6 +488,7 @@ class TranscriptManager:
     def _get_whisper_model(self):
         """Lazy-load and cache the faster-whisper model."""
         if hasattr(self, "_whisper") and self._whisper is not None:
+            logger.warning("Whisper model already loaded, reusing cached instance")
             return self._whisper
 
         from faster_whisper import WhisperModel
@@ -485,10 +496,26 @@ class TranscriptManager:
         size = self._whisper_model_size()
         device = self._whisper_device()
         compute = self._whisper_compute_type()
-        logger.info(
-            "Loading Whisper model: %s (device=%s, compute=%s)", size, device, compute
+        logger.warning(
+            "⏳ Loading Whisper model: %s (device=%s, compute=%s) — "
+            "首次使用需从 HuggingFace 下载模型文件（~3GB），请耐心等待...",
+            size, device, compute,
         )
+
+        # 诊断：检查 ctranslate2 CUDA 支持
+        try:
+            import ctranslate2
+            logger.warning("ctranslate2 版本: %s, CUDA 可用: %s", ctranslate2.__version__, ctranslate2.get_cuda_device_count())
+        except Exception:
+            logger.warning("无法检测 ctranslate2 CUDA 状态")
+
+        t0 = time.monotonic()
         self._whisper = WhisperModel(size, device=device, compute_type=compute)
+        elapsed = time.monotonic() - t0
+        logger.warning(
+            "✅ Whisper model loaded in %.1fs: %s (device=%s, compute=%s)",
+            elapsed, size, device, compute,
+        )
         return self._whisper
 
     async def _call_whisper_transcription(
@@ -499,6 +526,12 @@ class TranscriptManager:
         """
         if not file_path.exists():
             raise FileNotFoundError(f"Audio file not found: {file_path}")
+
+        file_size_mb = file_path.stat().st_size / 1024 / 1024
+        logger.warning(
+            "🎙 开始转录: %s (%.1f MB), 模型=%s, 语言=%s",
+            file_path.name, file_size_mb, model_size, self._language(),
+        )
 
         # 本地 Whisper 模型不支持并发调用（CTranslate2 非线程安全），
         # 使用 asyncio.Lock 确保同一时间只有一个转录任务在执行。
@@ -512,15 +545,39 @@ class TranscriptManager:
                 language=language,
                 vad_filter=True,
             )
+            logger.warning("▶ 开始 faster-whisper 推理（VAD + 识别）...")
+            sys.stderr.flush()
+            t0 = time.monotonic()
             loop = asyncio.get_running_loop()
             segments_iter, info = await loop.run_in_executor(None, _run)
-            segments = list(segments_iter)
+            logger.warning(
+                "▶ 推理完成 (%.1fs)，正在收集 segments...",
+                time.monotonic() - t0,
+            )
+            sys.stderr.flush()
+
+            # 逐个收集 segment 并打印进度
+            segments = []
+            t_seg_last = time.monotonic()
+            for i, seg in enumerate(segments_iter):
+                segments.append(seg)
+                now = time.monotonic()
+                if now - t_seg_last >= 5.0:
+                    logger.warning(
+                        "  转录进度: %d segments 已识别 (%.1fs)...",
+                        len(segments), now - t0,
+                    )
+                    sys.stderr.flush()
+                    t_seg_last = now
+
+        elapsed_total = time.monotonic() - t0
         detected_lang = info.language if info and info.language else (language or "zh")
 
-        logger.info(
-            "Whisper transcribed %d segments, detected lang=%s",
+        logger.warning(
+            "✅ Whisper 转录完成: %d segments, 语言=%s, 总耗时 %.1fs",
             len(segments),
             detected_lang,
+            elapsed_total,
         )
 
         text = "".join(

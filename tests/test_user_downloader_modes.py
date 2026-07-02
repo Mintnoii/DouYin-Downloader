@@ -248,7 +248,7 @@ def test_user_downloader_post_mode_uses_batch_db_insert(tmp_path, monkeypatch):
     async def _always_true(*_args, **_kwargs):
         return True
 
-    async def _fake_download_aweme_assets(item, _author, *, mode=None, db_batch=None):
+    async def _fake_download_aweme_assets(item, _author, *, mode=None, db_batch=None, **_kwargs):
         if db_batch is not None:
             db_batch.append(
                 {

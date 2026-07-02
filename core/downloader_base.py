@@ -1,3 +1,4 @@
+import asyncio
 import json
 import re
 from abc import ABC, abstractmethod
@@ -70,11 +71,13 @@ class DownloadResult:
         transcript: Optional[str] = None,
         transcript_reason: str = "",
         transcript_duration: Optional[float] = None,
+        transcript_error: str = "",
     ) -> None:
         """记录一条异常项。
 
         ``download``: 下载状态 ``"skipped"`` / ``"failed"``（成功则为 None）。
         ``transcript``: 转录状态 ``"skipped"`` / ``"failed"``（成功或无转录为 None）。
+        ``transcript_error``: 转录失败时的原始错误信息。
         """
         self.issues.append({
             "aweme_id": aweme_id,
@@ -84,6 +87,7 @@ class DownloadResult:
             "transcript": transcript,
             "transcript_reason": transcript_reason,
             "transcript_duration": transcript_duration,
+            "transcript_error": transcript_error,
         })
 
     def merge(self, other: "DownloadResult") -> None:
@@ -155,11 +159,15 @@ class BaseDownloader(ABC):
         except Exception as exc:
             logger.debug("Progress update_step failed: %s", exc)
 
-    def _progress_set_item_total(self, total: int, detail: str = "") -> None:
+    def _progress_set_item_total(self, total: int, detail: str = "", display_total: Optional[int] = None) -> None:
         if not self.progress_reporter:
             return
         try:
-            self.progress_reporter.set_item_total(total, detail)
+            fn = getattr(self.progress_reporter, "set_item_total", None)
+            if callable(fn):
+                fn(total, detail, display_total=display_total)
+            else:
+                self.progress_reporter.set_item_total(total, detail)
         except Exception as exc:
             logger.debug("Progress set_item_total failed: %s", exc)
 
@@ -170,6 +178,37 @@ class BaseDownloader(ABC):
             self.progress_reporter.advance_item(status, detail)
         except Exception as exc:
             logger.debug("Progress advance_item failed: %s", exc)
+
+    def _progress_extend_item_total(self, additional: int, detail: str = "") -> None:
+        """Increase the item total without resetting completed count.
+
+        Used to add transcription progress after downloads finish, so the
+        overall bar tracks download + transcription as one continuum.
+        """
+        if not self.progress_reporter or additional <= 0:
+            return
+        fn = getattr(self.progress_reporter, "extend_item_total", None)
+        if callable(fn):
+            try:
+                fn(additional, detail)
+            except Exception as exc:
+                logger.debug("Progress extend_item_total failed: %s", exc)
+
+    def _progress_advance_transcribe(self, detail: str = "") -> None:
+        """Advance item progress for a completed transcription.
+
+        Unlike ``_progress_advance_item``, this does **not** increment the
+        download success/failed/skipped counters — it only moves the
+        progress bar to reflect transcription work.
+        """
+        if not self.progress_reporter:
+            return
+        fn = getattr(self.progress_reporter, "advance_progress", None)
+        if callable(fn):
+            try:
+                fn(detail)
+            except Exception as exc:
+                logger.debug("Progress advance_progress failed: %s", exc)
 
     def _progress_report_author(
         self,
@@ -266,6 +305,41 @@ class BaseDownloader(ABC):
 
         self._local_aweme_ids = aweme_ids
 
+    def _find_local_media_by_aweme_id(self, aweme_id: str) -> Optional[Path]:
+        """在本地下载目录中查找指定 aweme_id 的媒体文件（优先视频）。
+
+        用于已下载视频跳过下载后仍然触发转录的场景。
+        """
+        if not aweme_id:
+            return None
+        base_path = self.file_manager.base_path
+        if not base_path.exists():
+            return None
+
+        candidates: List[Path] = []
+        video_suffixes = {".mp4", ".m4a", ".mov", ".webm", ".mkv", ".flv", ".avi"}
+        for path in base_path.rglob("*"):
+            if not path.is_file():
+                continue
+            if path.suffix.lower() not in self._local_media_suffixes:
+                continue
+            try:
+                if path.stat().st_size <= 0:
+                    continue
+            except OSError:
+                continue
+            if aweme_id in path.name:
+                candidates.append(path)
+
+        if not candidates:
+            return None
+
+        # 优先返回视频文件
+        for p in candidates:
+            if p.suffix.lower() in video_suffixes:
+                return p
+        return candidates[0]
+
     def _mark_local_aweme_downloaded(self, aweme_id: str):
         if not aweme_id:
             return
@@ -312,6 +386,8 @@ class BaseDownloader(ABC):
         mode: Optional[str] = None,
         *,
         db_batch: Optional[List[Dict[str, Any]]] = None,
+        transcribe: bool = True,
+        transcribe_queue: Optional[asyncio.Queue] = None,
     ) -> bool:
         aweme_id = aweme_data.get("aweme_id")
         if not aweme_id:
@@ -543,25 +619,29 @@ class BaseDownloader(ABC):
             self.file_manager.base_path, manifest_record
         )
 
-        transcript_result = None
         if media_type == "video" and video_path is not None:
-            transcript_result = await self.transcript_manager.process_video(
-                video_path, aweme_id=aweme_id
-            )
-            self._transcript_results[str(aweme_id)] = transcript_result
-            transcript_status = transcript_result.get("status")
-            if transcript_status == "skipped":
-                logger.info(
-                    "Transcript skipped for aweme %s: %s",
-                    aweme_id,
-                    transcript_result.get("reason", "unknown"),
+            if not transcribe and transcribe_queue is not None:
+                # 流水线模式：推入队列，由独立消费者异步转录
+                await transcribe_queue.put((video_path, str(aweme_id)))
+            elif transcribe:
+                # 原有行为：同步等待转录完成
+                transcript_result = await self.transcript_manager.process_video(
+                    video_path, aweme_id=aweme_id
                 )
-            elif transcript_status == "failed":
-                logger.warning(
-                    "Transcript failed for aweme %s: %s",
-                    aweme_id,
-                    transcript_result.get("error", "unknown"),
-                )
+                self._transcript_results[str(aweme_id)] = transcript_result
+                transcript_status = transcript_result.get("status")
+                if transcript_status == "skipped":
+                    logger.info(
+                        "Transcript skipped for aweme %s: %s",
+                        aweme_id,
+                        transcript_result.get("reason", "unknown"),
+                    )
+                elif transcript_status == "failed":
+                    logger.warning(
+                        "Transcript failed for aweme %s: %s",
+                        aweme_id,
+                        transcript_result.get("error", "unknown"),
+                    )
 
         self._mark_local_aweme_downloaded(aweme_id)
         logger.info("Downloaded %s: %s (%s)", media_type, desc, aweme_id)
