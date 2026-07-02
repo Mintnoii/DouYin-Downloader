@@ -276,11 +276,19 @@ class ProgressDisplay:
 
         self._active_console().print(table)
 
-        # ── 异常明细 ──────────────────────────────────────────────
+        # ── 明细（含下载异常和转录用时）──────────────────────────
         if result.issues:
             console = self._active_console()
             console.print()
-            console.print("[bold yellow]⚠ Issues:[/bold yellow]")
+            # 有失败项时用警告标题，纯成功时用信息标题
+            has_failure = any(
+                i.get("download") == "failed" or i.get("transcript") == "failed"
+                for i in result.issues
+            )
+            if has_failure:
+                console.print("[bold yellow]⚠ 明细（含失败项）:[/bold yellow]")
+            else:
+                console.print("[bold cyan]📋 明细:[/bold cyan]")
             for issue in result.issues:
                 self._print_issue(console, issue)
 
@@ -291,13 +299,15 @@ class ProgressDisplay:
         transcript_reason = issue.get("transcript_reason", "")
         transcript_error = issue.get("transcript_error", "")
         dl_dur = issue.get("download_duration")
+        dl_error = issue.get("download_error", "")
         t_dur = issue.get("transcript_duration")
 
         # 下载状态标签
         dl_tag = ""
         if download == "failed":
             dur_str = f" ({dl_dur:.1f}s)" if dl_dur is not None else ""
-            dl_tag = f" [red]下载失败{dur_str}[/red]"
+            err_str = f": {dl_error}" if dl_error else ""
+            dl_tag = f" [red]下载失败{dur_str}{err_str}[/red]"
         elif download == "skipped":
             dl_tag = " [dim]下载跳过[/dim]"
 
@@ -311,6 +321,8 @@ class ProgressDisplay:
                 t_tag = f" [red]转录失败: {label}{dur_str}{error_suffix}[/red]"
             elif transcript == "skipped":
                 t_tag = f" [dim]转录跳过: {label}[/dim]"
+            elif transcript == "success":
+                t_tag = f" [green]转录成功[/green]{dur_str}"
 
         console.print(f"  {desc}{dl_tag}{t_tag}")
 

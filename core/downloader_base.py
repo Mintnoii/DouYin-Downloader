@@ -68,6 +68,7 @@ class DownloadResult:
         *,
         download: Optional[str] = None,
         download_duration: Optional[float] = None,
+        download_error: str = "",
         transcript: Optional[str] = None,
         transcript_reason: str = "",
         transcript_duration: Optional[float] = None,
@@ -76,6 +77,7 @@ class DownloadResult:
         """记录一条异常项。
 
         ``download``: 下载状态 ``"skipped"`` / ``"failed"``（成功则为 None）。
+        ``download_error``: 下载失败时的原始错误信息。
         ``transcript``: 转录状态 ``"skipped"`` / ``"failed"``（成功或无转录为 None）。
         ``transcript_error``: 转录失败时的原始错误信息。
         """
@@ -84,6 +86,7 @@ class DownloadResult:
             "desc": desc,
             "download": download,
             "download_duration": download_duration,
+            "download_error": download_error,
             "transcript": transcript,
             "transcript_reason": transcript_reason,
             "transcript_duration": transcript_duration,
@@ -135,6 +138,7 @@ class BaseDownloader(ABC):
         self.metadata_handler = MetadataHandler()
         self.transcript_manager = TranscriptManager(self.config, self.file_manager, self.database)
         self._transcript_results: Dict[str, Dict[str, Any]] = {}
+        self._last_download_error: Optional[str] = None
         self._local_aweme_ids: Optional[set[str]] = None
         self._aweme_id_pattern = re.compile(r"(?<!\d)(\d{15,20})(?!\d)")
         self._local_media_suffixes = {
@@ -392,6 +396,7 @@ class BaseDownloader(ABC):
         aweme_id = aweme_data.get("aweme_id")
         if not aweme_id:
             logger.error("Missing aweme_id in aweme data")
+            self._last_download_error = "Missing aweme_id"
             return False
 
         desc = (aweme_data.get("desc", "no_title") or "").strip() or "no_title"
@@ -448,6 +453,7 @@ class BaseDownloader(ABC):
             video_info = self._build_no_watermark_url(aweme_data)
             if not video_info:
                 logger.error("No playable video URL found for aweme %s", aweme_id)
+                self._last_download_error = "No playable video URL"
                 return False
 
             video_url, video_headers = video_info
@@ -472,7 +478,8 @@ class BaseDownloader(ABC):
                         downloaded_files.append(cover_path)
 
             if self.config.get("music"):
-                music_url = self._extract_first_url(aweme_data.get("music", {}).get("play_url"))
+                music = aweme_data.get("music") or {}
+                music_url = self._extract_first_url(music.get("play_url"))
                 if music_url:
                     music_path = save_dir / f"{file_stem}_music.mp3"
                     if await self._download_with_retry(
@@ -502,6 +509,7 @@ class BaseDownloader(ABC):
                     "image_post_info" in aweme_data,
                     "images" in aweme_data,
                 )
+                self._last_download_error = "No gallery assets found"
                 return False
 
             for index, candidates in enumerate(image_url_candidates, start=1):
@@ -541,6 +549,7 @@ class BaseDownloader(ABC):
                 downloaded_files.append(live_path)
         else:
             logger.error("Unsupported media type for aweme %s: %s", aweme_id, media_type)
+            self._last_download_error = f"Unsupported media type: {media_type}"
             return False
 
         if self.config.get("avatar"):
@@ -676,6 +685,7 @@ class BaseDownloader(ABC):
             return await self.retry_handler.execute_with_retry(_task)
         except Exception as error:
             log_fn = logger.warning if optional else logger.error
+            self._last_download_error = str(error)
             self._log_download_error(
                 log_fn,
                 f"Download error for {save_path.name}: {error}",

@@ -291,6 +291,7 @@ class TranscriptManager:
                     )
                 except AudioExtractError as exc:
                     error_message = str(exc)
+                    elapsed = round(time.monotonic() - t_extract, 1)
                     await self._record_job(
                         aweme_id=aweme_id,
                         video_path=video_path,
@@ -311,6 +312,7 @@ class TranscriptManager:
                         "status": "failed",
                         "reason": "audio_extract_failed",
                         "error": error_message,
+                        "duration": elapsed,
                     }
                 upload_filename = f"{video_path.stem}.mp3"
                 upload_content_type = "audio/mpeg"

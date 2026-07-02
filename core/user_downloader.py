@@ -376,6 +376,7 @@ class UserDownloader(BaseDownloader):
                 "aweme_id": aweme_id,
                 "desc": desc,
                 "download_duration": dl_elapsed,
+                "download_error": self._last_download_error if not success else None,
             }
 
         download_results = await self.queue_manager.download_batch(_process_aweme, deduped_items)
@@ -400,19 +401,20 @@ class UserDownloader(BaseDownloader):
             aweme_id = str(entry.get("aweme_id") or "")
             desc = str(entry.get("desc") or aweme_id)
             dl_dur = entry.get("download_duration")
+            dl_error = str(entry.get("download_error") or "")
 
             if status == "success":
                 result.success += 1
             elif status == "failed":
                 result.failed += 1
-                result.add_issue(aweme_id, desc, download="failed", download_duration=dl_dur)
+                result.add_issue(aweme_id, desc, download="failed", download_duration=dl_dur, download_error=dl_error)
             elif status == "skipped":
                 result.skipped += 1
                 result.add_issue(aweme_id, desc, download="skipped")
             else:
                 result.failed += 1
                 self._progress_advance_item("failed", "unknown")
-                result.add_issue(aweme_id, desc, download="failed")
+                result.add_issue(aweme_id, desc, download="failed", download_error=dl_error)
 
             # 累积转录统计 + 异常明细
             transcript = self._transcript_results.pop(aweme_id, None)
@@ -421,12 +423,21 @@ class UserDownloader(BaseDownloader):
                 t_dur = transcript.get("duration")
                 if t_status == "success":
                     result.add_transcript_success()
+                    # 成功转录也加入 issues，让用户看到每个视频的转录用时
+                    result.add_issue(
+                        aweme_id, desc,
+                        download=None if status == "success" else status,
+                        download_error=dl_error if status != "success" else "",
+                        transcript="success", transcript_reason="",
+                        transcript_duration=t_dur,
+                    )
                 elif t_status == "skipped":
                     reason = transcript.get("reason", "unknown")
                     result.add_transcript_skip(reason)
                     result.add_issue(
                         aweme_id, desc,
                         download=None if status == "success" else status,
+                        download_error=dl_error if status != "success" else "",
                         transcript="skipped", transcript_reason=reason,
                         transcript_duration=t_dur,
                         transcript_error=str(transcript.get("error", "")),
@@ -438,6 +449,7 @@ class UserDownloader(BaseDownloader):
                     result.add_issue(
                         aweme_id, desc,
                         download=None if status == "success" else status,
+                        download_error=dl_error if status != "success" else "",
                         transcript="failed", transcript_reason=reason,
                         transcript_duration=t_dur,
                         transcript_error=error_msg,
