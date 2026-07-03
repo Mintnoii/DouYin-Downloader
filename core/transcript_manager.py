@@ -273,9 +273,7 @@ class TranscriptManager:
 
         try:
             if not is_source_audio and self._upload_audio_only():
-                logger.info(
-                    "🔊 提取音频: %s → mp3 (ffmpeg)", video_path.name,
-                )
+                logger.info("🔊 提取音频 %s", video_path.stem)
                 t_extract = time.monotonic()
                 tmp_audio_dir = tempfile.TemporaryDirectory(
                     prefix="transcript_audio_"
@@ -284,11 +282,8 @@ class TranscriptManager:
                     upload_path = await extract_audio(
                         video_path, Path(tmp_audio_dir.name)
                     )
-                    logger.info(
-                        "🔊 音频提取完成 (%.1fs): %s",
-                        time.monotonic() - t_extract,
-                        upload_path.name,
-                    )
+                    elapsed_extract = round(time.monotonic() - t_extract, 1)
+                    logger.info("🔊 提取完成 %.1fs %s", elapsed_extract, video_path.stem)
                 except AudioExtractError as exc:
                     error_message = str(exc)
                     elapsed = round(time.monotonic() - t_extract, 1)
@@ -490,10 +485,18 @@ class TranscriptManager:
     def _get_whisper_model(self):
         """Lazy-load and cache the faster-whisper model."""
         if hasattr(self, "_whisper") and self._whisper is not None:
-            logger.warning("Whisper model already loaded, reusing cached instance")
+            print(f"[whisper] 模型已缓存 (device={self._whisper_device()}, compute={self._whisper_compute_type()})", file=sys.stderr, flush=True)
+            logger.warning(
+                "Whisper model already loaded (device=%s, compute=%s), reusing cached instance",
+                self._whisper_device(), self._whisper_compute_type(),
+            )
             return self._whisper
 
+        import ctranslate2
+        print(f"[whisper] ctranslate2 {ctranslate2.__version__}, CUDA设备数={ctranslate2.get_cuda_device_count()}", file=sys.stderr, flush=True)
+
         from faster_whisper import WhisperModel
+        print("[whisper] faster_whisper 导入成功，开始加载模型...", file=sys.stderr, flush=True)
 
         size = self._whisper_model_size()
         device = self._whisper_device()
@@ -503,6 +506,7 @@ class TranscriptManager:
             "首次使用需从 HuggingFace 下载模型文件（~3GB），请耐心等待...",
             size, device, compute,
         )
+        sys.stderr.flush()
 
         # 诊断：检查 ctranslate2 CUDA 支持
         try:
@@ -512,8 +516,10 @@ class TranscriptManager:
             logger.warning("无法检测 ctranslate2 CUDA 状态")
 
         t0 = time.monotonic()
+        print(f"[whisper] 正在加载 {size} 模型 (device={device}, compute={compute})...", file=sys.stderr, flush=True)
         self._whisper = WhisperModel(size, device=device, compute_type=compute)
         elapsed = time.monotonic() - t0
+        print(f"[whisper] 模型加载完成 {elapsed:.1f}s", file=sys.stderr, flush=True)
         logger.warning(
             "✅ Whisper model loaded in %.1fs: %s (device=%s, compute=%s)",
             elapsed, size, device, compute,
@@ -530,15 +536,21 @@ class TranscriptManager:
             raise FileNotFoundError(f"Audio file not found: {file_path}")
 
         file_size_mb = file_path.stat().st_size / 1024 / 1024
+        device = self._whisper_device()
+        compute = self._whisper_compute_type()
+        device_label = "GPU(CUDA)" if device == "cuda" else f"CPU({compute})"
         logger.warning(
-            "🎙 开始转录: %s (%.1f MB), 模型=%s, 语言=%s",
-            file_path.name, file_size_mb, model_size, self._language(),
+            "🎙 转录 %s (%.1fMB, %s, %s)",
+            file_path.stem, file_size_mb, model_size, device_label,
         )
 
         # 本地 Whisper 模型不支持并发调用（CTranslate2 非线程安全），
         # 使用 asyncio.Lock 确保同一时间只有一个转录任务在执行。
+        print("[whisper] 获取模型锁...", file=sys.stderr, flush=True)
         async with self._whisper_lock:
+            print("[whisper] 调用 _get_whisper_model...", file=sys.stderr, flush=True)
             model = self._get_whisper_model()
+            print("[whisper] 模型就绪，开始推理...", file=sys.stderr, flush=True)
             language = self._language()
 
             _run = partial(

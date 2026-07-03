@@ -3,6 +3,8 @@ import re
 from pathlib import Path
 from typing import Dict, Optional, Union
 
+import asyncio
+
 import aiofiles
 import aiohttp
 
@@ -226,14 +228,26 @@ class FileManager:
                     os.replace(str(tmp_path), str(final_path))
                     return final_path if return_saved_path else True
                 else:
-                    logger.debug(
-                        "Download failed for %s, status=%s",
-                        final_path.name,
+                    # 读取响应体帮助排查问题（截断）
+                    try:
+                        body = await response.text()
+                        body_snippet = body[:500] if body else "(empty)"
+                    except Exception:
+                        body_snippet = "(unable to read body)"
+                    logger.warning(
+                        "Download HTTP %d for %s -> %s | resp: %s",
                         response.status,
+                        save_path.name,
+                        url[:120],
+                        body_snippet,
                     )
                     return False
+        except asyncio.TimeoutError:
+            logger.warning("Download timeout for %s (300s): %s", save_path.name, url[:120])
+            tmp_path.unlink(missing_ok=True)
+            return False
         except Exception as e:
-            logger.debug("Download error for %s: %s", final_path.name, e)
+            logger.warning("Download error for %s: %s | url=%s", save_path.name, e, url[:120])
             tmp_path.unlink(missing_ok=True)
             return False
         finally:

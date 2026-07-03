@@ -1,0 +1,4 @@
+# Rust ↔ Python Sidecar PoC — 编译产物
+poc.exe
+poc.pdb
+target/

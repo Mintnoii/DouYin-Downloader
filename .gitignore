@@ -34,9 +34,13 @@ logs/
 Downloaded/
 Transcripts/
 dy_downloader.db
+dy_downloader.db-shm
+dy_downloader.db-wal
 *.db
 *.sqlite
 *.sqlite3
+*.db-shm
+*.db-wal
 
 # Local config/secrets
 config*.yml

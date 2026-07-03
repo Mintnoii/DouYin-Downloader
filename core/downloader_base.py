@@ -462,6 +462,7 @@ class BaseDownloader(ABC):
                 video_url, video_path, session, headers=video_headers
             ):
                 return False
+            logger.info("▼ 下载完成 %s", file_stem)
             downloaded_files.append(video_path)
 
             if self.config.get("cover"):

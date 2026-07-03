@@ -1,0 +1,9 @@
+[package]
+name = "douyin-downloader-sidecar-poc"
+version = "0.1.0"
+edition = "2021"
+description = "PoC: Rust 调用 Python sidecar 实现抖音下载 + 转录"
+
+# 零外部依赖——手写 JSON 解析器，可直接用 rustc 编译：
+#   rustc -o poc.exe src/main.rs
+[dependencies]

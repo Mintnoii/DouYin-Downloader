@@ -232,8 +232,8 @@ class FfmpegLocator:
 # ---------------------------------------------------------------------------
 
 
-_FFMPEG_TIMEOUT_SECONDS = 600.0
-"""ffmpeg 抽音子进程硬超时（requirements R1.10 / R1.11）。"""
+_FFMPEG_TIMEOUT_SECONDS = 60.0
+"""ffmpeg 抽音子进程硬超时。"""
 
 _STDERR_RING_LIMIT_BYTES = 1 * 1024 * 1024
 """stderr 环形缓冲上限（requirements R1.12）。"""
@@ -280,13 +280,22 @@ async def extract_audio(
     output_dir.mkdir(parents=True, exist_ok=True)
     output_path = output_dir / f"{video_path.stem}.mp3"
 
+    # Windows: 使用 \\?\ 前缀确保 Unicode 路径正确传递给 ffmpeg
+    _input = str(video_path.resolve())
+    _output = str(output_path.resolve())
+    if os.name == "nt":
+        if not _input.startswith("\\\\?\\"):
+            _input = "\\\\?\\" + _input
+        if not _output.startswith("\\\\?\\"):
+            _output = "\\\\?\\" + _output
+
     args = (
         ffmpeg_path,
         "-y",  # overwrite output if it somehow already exists
         "-i",
-        str(video_path),
+        _input,
         *_FFMPEG_EXTRACT_ARGS,
-        str(output_path),
+        _output,
     )
 
     proc = await asyncio.create_subprocess_exec(
